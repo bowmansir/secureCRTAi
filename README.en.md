@@ -1,6 +1,6 @@
 # TermAI
 
-[中文](README.md) | [English](README.en.md)
+[English](README.md) | [中文](README.zh.md)
 
 **TermAI is an AI-native remote terminal manager.**
 
