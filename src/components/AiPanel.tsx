@@ -48,6 +48,8 @@ type AgentStepOptions = {
 type SendOptions = {
   key?: string;
   sessionId?: string;
+  useAgent?: boolean;
+  env?: string;
 };
 
 const AGENT_RUN_TIMEOUT_MS = 35_000;
@@ -80,6 +82,10 @@ const SYSTEM_PROMPT = `你是 TermAI 内置的运维终端助手。用户正在�
 4. 用中文回答。`;
 
 // ---------- 轻量 markdown 渲染 ----------
+
+function getScopedConversationKey(key: string, useAgent: boolean): string {
+  return `${useAgent ? "agent" : "chat"}:${key}`;
+}
 
 /** 按 ``` 代码块切开 */
 function splitBlocks(text: string): { code: boolean; content: string }[] {
@@ -126,7 +132,38 @@ function renderInline(text: string, keyPrefix: string): ReactNode[] {
   return nodes;
 }
 
-/** 非代码块文本渲染为段落/列表；空行转为段距（不与块级换行叠加） */
+function parseTableRow(line: string): string[] | null {
+  const trimmed = line.trim();
+  if (!trimmed.includes("|")) return null;
+  const body = trimmed.replace(/^\|/, "").replace(/\|$/, "");
+  const cells: string[] = [];
+  let cell = "";
+  for (let i = 0; i < body.length; i++) {
+    const char = body[i];
+    if (char === "\\" && body[i + 1] === "|") {
+      cell += "|";
+      i++;
+    } else if (char === "|") {
+      cells.push(cell.trim());
+      cell = "";
+    } else {
+      cell += char;
+    }
+  }
+  cells.push(cell.trim());
+  return cells.length > 1 ? cells : null;
+}
+
+function parseTableAlignments(cells: string[]): Array<"left" | "center" | "right"> | null {
+  if (!cells.every((cell) => /^:?-{3,}:?$/.test(cell))) return null;
+  return cells.map((cell) => {
+    if (cell.startsWith(":") && cell.endsWith(":")) return "center";
+    if (cell.endsWith(":")) return "right";
+    return "left";
+  });
+}
+
+/** 非代码块文本渲染为段落/列表/表格；空行转为段距（不与块级换行叠加） */
 function renderProse(text: string, keyPrefix: string): ReactNode {
   const lines = text.split("\n");
   const out: ReactNode[] = [];
@@ -144,7 +181,51 @@ function renderProse(text: string, keyPrefix: string): ReactNode {
       listGap = false;
     }
   };
-  lines.forEach((line, idx) => {
+  for (let idx = 0; idx < lines.length; idx++) {
+    const line = lines[idx];
+    const headers = parseTableRow(line);
+    const divider = idx + 1 < lines.length ? parseTableRow(lines[idx + 1]) : null;
+    const alignments = divider ? parseTableAlignments(divider) : null;
+    if (headers && alignments && headers.length === alignments.length) {
+      flushList();
+      const rows: string[][] = [];
+      idx += 2;
+      while (idx < lines.length) {
+        const row = parseTableRow(lines[idx]);
+        if (!row) break;
+        rows.push(headers.map((_, cellIndex) => row[cellIndex] ?? ""));
+        idx++;
+      }
+      idx--;
+      out.push(
+        <div key={`${keyPrefix}-table${out.length}`} className={`ai-table-wrap${pendingGap ? " para-gap" : ""}`}>
+          <table className="ai-table">
+            <thead>
+              <tr>
+                {headers.map((header, cellIndex) => (
+                  <th key={`${keyPrefix}-th${cellIndex}`} style={{ textAlign: alignments[cellIndex] }}>
+                    {renderInline(header, `${keyPrefix}-th${cellIndex}`)}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((row, rowIndex) => (
+                <tr key={`${keyPrefix}-tr${rowIndex}`}>
+                  {row.map((cell, cellIndex) => (
+                    <td key={`${keyPrefix}-td${rowIndex}-${cellIndex}`} style={{ textAlign: alignments[cellIndex] }}>
+                      {renderInline(cell, `${keyPrefix}-td${rowIndex}-${cellIndex}`)}
+                    </td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      );
+      pendingGap = false;
+      continue;
+    }
     const bullet = line.match(/^\s*[-*]\s+(.*)$/);
     const numbered = line.match(/^\s*\d+\.\s+(.*)$/);
     if (bullet || numbered) {
@@ -163,7 +244,7 @@ function renderProse(text: string, keyPrefix: string): ReactNode {
       );
       pendingGap = false;
     }
-  });
+  }
   flushList();
   return out;
 }
@@ -313,28 +394,33 @@ export default function AiPanel({
   closeAgentRequest,
 }: Props) {
   const { confirm } = useDialogs();
-  // 每个终端标签一份对话历史，按 conversationKey 存取
+  // 每个终端标签的普通对话与 Agent 对话分别存储，避免执行结果污染普通上下文。
   const [convos, setConvos] = useState<Record<string, UiChatMessage[]>>({});
   const convosRef = useRef<Record<string, UiChatMessage[]>>({});
-  const messages = convos[conversationKey] ?? [];
-  const [input, setInput] = useState("");
-  const [streaming, setStreaming] = useState(false);
   const [includeContext, setIncludeContext] = useState(true);
-  const [agentMode, setAgentMode] = useState(false);
-  const [agentBusy, setAgentBusy] = useState(false);
+  const [agentModes, setAgentModes] = useState<Record<string, boolean>>({});
+  const agentModesRef = useRef<Record<string, boolean>>({});
+  const agentMode = Boolean(activeSessionId && agentModes[conversationKey]);
+  const activeConversationKey = getScopedConversationKey(conversationKey, agentMode);
+  const messages = convos[activeConversationKey] ?? [];
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
+  const input = drafts[activeConversationKey] ?? "";
+  const [streamingKeys, setStreamingKeys] = useState<Set<string>>(() => new Set());
+  const streamingKeysRef = useRef<Set<string>>(new Set());
+  const [agentBusyKeys, setAgentBusyKeys] = useState<Set<string>>(() => new Set());
+  const agentBusyKeysRef = useRef<Set<string>>(new Set());
+  const streaming = streamingKeys.has(activeConversationKey);
+  const agentBusy = agentBusyKeys.has(activeConversationKey);
   const scrollRef = useRef<HTMLDivElement>(null);
-  const abortRef = useRef(false);
-  const streamingRef = useRef(false);
-  const agentBusyRef = useRef(false);
-  const agentModeRef = useRef(false);
+  const abortedKeys = useRef<Set<string>>(new Set());
   const activeSessionIdRef = useRef<string | undefined>(activeSessionId);
   // 每个会话一条常驻 Agent 通道
   const agentIds = useRef<Record<string, string>>({});
   const agentAutoSteps = useRef<Record<string, number>>({});
   const agentGoals = useRef<Record<string, string>>({});
   const agentExecutedCommands = useRef<Record<string, Set<string>>>({});
-  const agentRunSeq = useRef(0);
-  const runningAgentKey = useRef<string | null>(null);
+  const agentRunSeq = useRef<Record<string, number>>({});
+  const conversationEnvs = useRef<Record<string, string>>({});
   const handledCloseNonce = useRef<number | null>(null);
 
   const setMessagesFor = (key: string, updater: (prev: UiChatMessage[]) => UiChatMessage[]) =>
@@ -344,19 +430,33 @@ export default function AiPanel({
       return next;
     });
 
-  const setStreamingState = (value: boolean) => {
-    streamingRef.current = value;
-    setStreaming(value);
+  const setStreamingFor = (key: string, value: boolean) => {
+    const next = new Set(streamingKeysRef.current);
+    if (value) next.add(key);
+    else next.delete(key);
+    streamingKeysRef.current = next;
+    setStreamingKeys(next);
   };
 
-  const setAgentBusyState = (value: boolean) => {
-    agentBusyRef.current = value;
-    setAgentBusy(value);
+  const setAgentBusyFor = (key: string, value: boolean) => {
+    const next = new Set(agentBusyKeysRef.current);
+    if (value) next.add(key);
+    else next.delete(key);
+    agentBusyKeysRef.current = next;
+    setAgentBusyKeys(next);
   };
 
-  useEffect(() => {
-    agentModeRef.current = agentMode;
-  }, [agentMode]);
+  const setAgentModeFor = (key: string, value: boolean) => {
+    const next = { ...agentModesRef.current, [key]: value };
+    agentModesRef.current = next;
+    setAgentModes(next);
+  };
+
+  const bumpAgentRunSeq = (key: string): number => {
+    const next = (agentRunSeq.current[key] ?? 0) + 1;
+    agentRunSeq.current[key] = next;
+    return next;
+  };
 
   useEffect(() => {
     convosRef.current = convos;
@@ -375,24 +475,31 @@ export default function AiPanel({
   };
 
   const resetAgentChannel = (key: string) => {
-    agentRunSeq.current += 1;
-    if (runningAgentKey.current === key) runningAgentKey.current = null;
+    abortedKeys.current.add(key);
+    bumpAgentRunSeq(key);
     closeAgentChannel(key);
     agentAutoSteps.current[key] = 0;
     delete agentGoals.current[key];
     delete agentExecutedCommands.current[key];
-    setAgentBusyState(false);
+    setAgentBusyFor(key, false);
+    setStreamingFor(key, false);
   };
 
   const disposeConversationKeys = (keys: string[]) => {
-    const keySet = new Set(keys.filter(Boolean));
+    const keySet = new Set(
+      keys.filter(Boolean).flatMap((key) => [
+        getScopedConversationKey(key, false),
+        getScopedConversationKey(key, true),
+      ])
+    );
     if (keySet.size === 0) return;
-    if (runningAgentKey.current && keySet.has(runningAgentKey.current)) {
-      agentRunSeq.current += 1;
-      runningAgentKey.current = null;
-      setAgentBusyState(false);
-    }
-    keySet.forEach(closeAgentChannel);
+    keySet.forEach((key) => {
+      abortedKeys.current.add(key);
+      bumpAgentRunSeq(key);
+      setAgentBusyFor(key, false);
+      setStreamingFor(key, false);
+      closeAgentChannel(key);
+    });
     setConvos((prev) => {
       let changed = false;
       const next = { ...prev };
@@ -404,9 +511,21 @@ export default function AiPanel({
         delete agentGoals.current[key];
         delete agentAutoSteps.current[key];
         delete agentExecutedCommands.current[key];
+        delete conversationEnvs.current[key];
       });
       if (changed) convosRef.current = next;
       return changed ? next : prev;
+    });
+    setDrafts((prev) => {
+      const next = { ...prev };
+      keySet.forEach((key) => delete next[key]);
+      return next;
+    });
+    setAgentModes((prev) => {
+      const next = { ...prev };
+      keys.forEach((key) => delete next[key]);
+      agentModesRef.current = next;
+      return next;
     });
   };
 
@@ -428,18 +547,23 @@ export default function AiPanel({
   }, [messages]);
 
   const stop = () => {
-    abortRef.current = true;
-    agentRunSeq.current += 1;
-    runningAgentKey.current = null;
-    setAgentBusyState(false);
-    setStreamingState(false);
+    const key = activeConversationKey;
+    abortedKeys.current.add(key);
+    bumpAgentRunSeq(key);
+    closeAgentChannel(key);
+    setAgentBusyFor(key, false);
+    setStreamingFor(key, false);
   };
 
   const send = async (userText: string, meta?: AgentExecMeta, options?: SendOptions) => {
-    if (!userText.trim() || streamingRef.current || agentBusyRef.current) return;
-    const key = options?.key ?? conversationKey; // 锁定发起时的归属，流式中切标签也写回原会话
     const sessionId = options?.sessionId ?? activeSessionId ?? activeSessionIdRef.current;
-    const useAgent = agentModeRef.current && Boolean(sessionId);
+    const useAgent = options?.useAgent ?? Boolean(sessionId && agentModesRef.current[conversationKey]);
+    const key = options?.key ?? getScopedConversationKey(conversationKey, useAgent);
+    if (
+      !userText.trim() ||
+      streamingKeysRef.current.has(key) ||
+      agentBusyKeysRef.current.has(key)
+    ) return;
     if (useAgent && !meta) {
       agentAutoSteps.current[key] = 0;
       agentGoals.current[key] = userText.trim();
@@ -462,12 +586,13 @@ export default function AiPanel({
       { role: "user", content: userText.trim(), meta },
       { role: "assistant", content: "" },
     ]);
-    setInput("");
-    abortRef.current = false;
-    setStreamingState(true);
+    if (!meta) setDrafts((prev) => ({ ...prev, [key]: "" }));
+    abortedKeys.current.delete(key);
+    setStreamingFor(key, true);
 
     // 环境信息注入 system prompt；Agent 模式用 Agent 提示词
-    const env = getEnv().trim();
+    const env = options?.env ?? (meta ? conversationEnvs.current[key] ?? "" : getEnv().trim());
+    conversationEnvs.current[key] = env;
     const base = useAgent ? AGENT_SYSTEM_PROMPT : SYSTEM_PROMPT;
     const sys = env ? `${base}\n\n【当前服务器环境】\n${env}` : base;
     let assistantText = "";
@@ -481,18 +606,18 @@ export default function AiPanel({
 
     try {
       await api.aiChat(sys, history, (e) => {
-        if (abortRef.current) return;
+        if (abortedKeys.current.has(key)) return;
         if (e.type === "delta") {
           assistantText += e.text;
           appendToLast(e.text);
         }
         else if (e.type === "error") {
           appendToLast(`\n[错误] ${e.message}`);
-          setStreamingState(false);
+          setStreamingFor(key, false);
         } else if (e.type === "done") {
-          setStreamingState(false);
+          setStreamingFor(key, false);
           const commands = useAgent ? extractAgentCommands(assistantText) : [];
-          if (commands.length > 0 && agentModeRef.current && sessionId) {
+          if (commands.length > 0 && sessionId) {
             window.setTimeout(() => {
               void runAgentBatch(commands, { key, sessionId, auto: true });
             }, 0);
@@ -500,8 +625,9 @@ export default function AiPanel({
         }
       });
     } catch (err) {
+      if (abortedKeys.current.has(key)) return;
       appendToLast(`\n[错误] ${String(err)}`);
-      setStreamingState(false);
+      setStreamingFor(key, false);
     }
   };
 
@@ -520,9 +646,12 @@ export default function AiPanel({
   };
 
   const clearConversation = () => {
-    if (streamingRef.current || agentBusyRef.current) return;
-    const key = conversationKey;
-    resetAgentChannel(key);
+    if (
+      streamingKeysRef.current.has(activeConversationKey) ||
+      agentBusyKeysRef.current.has(activeConversationKey)
+    ) return;
+    const key = activeConversationKey;
+    if (agentMode) resetAgentChannel(key);
     setConvos((prev) => {
       const next = { ...prev, [key]: [] };
       convosRef.current = next;
@@ -532,13 +661,13 @@ export default function AiPanel({
 
   /** Agent 模式：执行 AI 给出的一批命令，把结果汇总喂回 AI 决定下一步 */
   const runAgentBatch = async (commandInput: string[] | string, options?: AgentStepOptions) => {
-    if (streamingRef.current || agentBusyRef.current) return;
     const commands = (Array.isArray(commandInput) ? commandInput : [commandInput])
       .map((c) => c.trim())
       .filter(Boolean)
       .slice(0, AGENT_MAX_COMMANDS_PER_BATCH);
     if (commands.length === 0) return;
-    const key = options?.key ?? conversationKey;
+    const key = options?.key ?? getScopedConversationKey(conversationKey, true);
+    if (streamingKeysRef.current.has(key) || agentBusyKeysRef.current.has(key)) return;
     const sessionId = options?.sessionId ?? activeSessionId ?? activeSessionIdRef.current;
     if (!sessionId) {
       setMessagesFor(key, (prev) => [
@@ -558,9 +687,8 @@ export default function AiPanel({
         return;
       }
     }
-    const runSeq = ++agentRunSeq.current;
-    runningAgentKey.current = key;
-    setAgentBusyState(true);
+    const runSeq = bumpAgentRunSeq(key);
+    setAgentBusyFor(key, true);
     try {
       let aid = agentIds.current[key];
       if (!aid) {
@@ -569,9 +697,8 @@ export default function AiPanel({
           AGENT_RUN_TIMEOUT_MS,
           "Agent 连接超时，已取消本次执行。"
         );
-        if (runSeq !== agentRunSeq.current) {
+        if (runSeq !== agentRunSeq.current[key]) {
           api.agentClose(aid).catch(() => {});
-          if (runningAgentKey.current === key) runningAgentKey.current = null;
           return;
         }
         agentIds.current[key] = aid;
@@ -620,8 +747,7 @@ export default function AiPanel({
             AGENT_RUN_TIMEOUT_MS,
             "Agent 执行超时，已重置执行通道。请确认命令会自动结束后再重试。"
           );
-          if (runSeq !== agentRunSeq.current) {
-            if (runningAgentKey.current === key) runningAgentKey.current = null;
+          if (runSeq !== agentRunSeq.current[key]) {
             return;
           }
           const rawOutput = result.output;
@@ -653,8 +779,8 @@ export default function AiPanel({
       const detail = buildAgentExecDetail(results);
       const firstProblem = results.find((r) => r.exitCode !== 0);
       const worstExitCode = firstProblem ? firstProblem.exitCode : 0;
-      setAgentBusyState(false);
-      if (runningAgentKey.current === key) runningAgentKey.current = null;
+      if (runSeq !== agentRunSeq.current[key]) return;
+      setAgentBusyFor(key, false);
       await send(feedback, {
         kind: "agent-exec",
         command: results.map((r) => r.command).join("\n"),
@@ -663,15 +789,16 @@ export default function AiPanel({
         output: detail.output,
         outputChars: detail.outputChars,
         truncated: detail.truncated,
-      }, { key, sessionId }); // 结果喂回 AI，产生下一步
+      }, {
+        key,
+        sessionId,
+        useAgent: true,
+        env: conversationEnvs.current[key] ?? "",
+      }); // 结果喂回 AI，产生下一步
     } catch (e) {
-      if (runSeq !== agentRunSeq.current) {
-        if (runningAgentKey.current === key) runningAgentKey.current = null;
-        return;
-      }
+      if (runSeq !== agentRunSeq.current[key]) return;
       closeAgentChannel(key);
-      setAgentBusyState(false);
-      if (runningAgentKey.current === key) runningAgentKey.current = null;
+      setAgentBusyFor(key, false);
       setMessagesFor(key, (prev) => [
         ...prev,
         { role: "assistant", content: `[Agent 执行失败] ${String(e)}` },
@@ -712,9 +839,9 @@ export default function AiPanel({
                 checked={agentMode}
                 disabled={!activeSessionId}
                 onChange={(e) => {
-                  agentModeRef.current = e.target.checked;
-                  resetAgentChannel(conversationKey);
-                  setAgentMode(e.target.checked);
+                  const nextAgentMode = e.target.checked;
+                  resetAgentChannel(getScopedConversationKey(conversationKey, true));
+                  setAgentModeFor(conversationKey, nextAgentMode);
                 }}
               />
             Agent
@@ -795,7 +922,9 @@ export default function AiPanel({
           placeholder="描述任务或提问，例如：查看占用 8080 端口的进程"
           value={input}
           disabled={streaming || agentBusy}
-          onChange={(e) => setInput(e.target.value)}
+          onChange={(e) =>
+            setDrafts((prev) => ({ ...prev, [activeConversationKey]: e.target.value }))
+          }
           onKeyDown={(e) => {
             if (e.key === "Enter" && !e.shiftKey) {
               e.preventDefault();
