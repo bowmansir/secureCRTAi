@@ -36,6 +36,8 @@ export default function StatusBar({
   let address = "";
   let protocol = "";
   const isTerminal = activeTab?.kind === "local" || activeTab?.kind === "ssh";
+  const showsTerminalShortcuts =
+    activeTab?.kind === "local" || activeTab?.kind === "ssh" || activeTab?.kind === "sftp-cli";
   const transferRate = fmtRate(transferRateBps);
   if (activeTab) {
     if (activeTab.kind === "local") {
@@ -61,6 +63,16 @@ export default function StatusBar({
           </>
         ) : (
           <span className="sb-idle">就绪</span>
+        )}
+      </div>
+      <div className="status-center">
+        {showsTerminalShortcuts && (
+          <span
+            className="sb-shortcuts"
+            title="复制：Ctrl+Shift+C 或 Ctrl+Insert；粘贴：Ctrl+Shift+V 或 Shift+Insert"
+          >
+            复制 Ctrl+Shift+C / Ctrl+Insert · 粘贴 Ctrl+Shift+V / Shift+Insert
+          </span>
         )}
       </div>
       <div className="status-right">

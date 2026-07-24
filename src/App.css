@@ -939,6 +939,7 @@ body,
 }
 
 .status-left,
+.status-center,
 .status-right {
   display: flex;
   align-items: center;
@@ -947,7 +948,18 @@ body,
 }
 
 .status-left {
-  flex: 1;
+  flex: 1 1 0;
+}
+
+.status-center {
+  flex: 1 1 0;
+  justify-content: center;
+  overflow: hidden;
+}
+
+.status-right {
+  flex: 1 1 0;
+  justify-content: flex-end;
 }
 
 .sb-dot {
@@ -975,8 +987,16 @@ body,
 .sb-item,
 .sb-brand,
 .sb-health,
-.sb-transfer {
+.sb-transfer,
+.sb-shortcuts {
   white-space: nowrap;
+}
+
+.sb-shortcuts {
+  max-width: 100%;
+  overflow: hidden;
+  color: var(--text-dim);
+  text-overflow: ellipsis;
 }
 
 .sb-proto,
