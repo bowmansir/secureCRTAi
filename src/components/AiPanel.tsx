@@ -28,6 +28,7 @@ interface Props {
 type AgentExecMeta = {
   kind: "agent-exec";
   command: string;
+  commandCount?: number;
   exitCode: number | null;
   output: string;
   outputChars: number;
@@ -51,19 +52,22 @@ type SendOptions = {
 
 const AGENT_RUN_TIMEOUT_MS = 35_000;
 const AGENT_MAX_AUTO_STEPS = 12;
+const AGENT_MAX_COMMANDS_PER_BATCH = 5;
+const AGENT_OUTPUT_PER_COMMAND_LIMIT = 2600;
+const AGENT_EXEC_DETAIL_LIMIT = 4200;
 
 const AGENT_SYSTEM_PROMPT = `你是 TermAI 的运维 Agent，在用户的真实服务器上分步执行任务。
 核心原则：
 1. 不要把自己当聊天问答助手，要像资深运维一样先收集证据、再判断、再行动。
 2. 用户目标即使比较宽泛，也优先执行安全的只读探测命令，不要一上来要求用户细化。只有会修改系统、会部署/删除/重启、或确实无法确定目标对象时才追问。
-3. 每次只输出【下一条】命令，放在单独的 \`\`\` 代码块里（一个代码块只放一条命令）。代码块外用一句话说明为什么执行它。
-4. 命令必须非交互、可自动结束；实时/全屏命令要改成有限运行形式，例如 top -b -n 1、timeout 8s tail -f ...。
-5. 安全命令会自动执行；危险操作（删除/重启/权限变更/安装软件/覆盖配置）必须先明确警告，系统会要求用户确认。
-6. 命令执行后其"退出码 + 输出"会作为下一条消息发回给你，你要继续基于证据推进，不要重复问同一个问题。
-7. 目标达成时，回复以"任务完成"开头给出简明结论，且【不要】再输出任何命令代码块。
+3. 每轮先给出一句执行意图，然后输出 1 到 5 个 \`\`\` 代码块；每个代码块只放一条命令。安全、只读、互相独立的探测命令应放在同一轮执行，不要机械地一条条请求。
+4. 命令必须非交互、可自动结束；实时/全屏命令要改成有限运行形式，例如 top -b -n 1、timeout 8s tail -f ...。需要进入目录时，用 cd /path && command 这类自包含命令，不要依赖上一条命令的隐藏状态。
+5. 安全命令会自动批量执行；危险操作（删除/重启/权限变更/安装软件/覆盖配置）不要混进批量探测里，必须单独给出并先明确警告，系统会要求用户确认。
+6. 命令执行后其"退出码 + 输出"会作为下一条消息发回给你，你要继续基于证据推进。不要重复执行已经有结论的 uptime/free/top/df 等同类探测。
+7. 如果一轮批量探测已经足够判断，直接以"任务完成"开头给出结论；目标达成时【不要】再输出任何命令代码块。
 
 常见任务策略：
-- 性能/卡顿/负载问题：默认依次检查 uptime、CPU/内存/top、磁盘空间、磁盘 IO、网络连接、关键错误日志；不要先追问"具体性能目标"。
+- 性能/卡顿/负载问题：先组合一轮只读诊断批次，覆盖 uptime、CPU/内存/top、磁盘空间、磁盘 IO、网络连接、关键错误日志；不要拆成多个重复小步骤。
 - 部署服务：先发现当前目录、常见项目文件、systemd 服务、Docker/Compose、运行进程和监听端口；若用户说"所有"，理解为"把当前机器上可识别的服务都盘点出来"，先只读盘点，再让用户确认要部署哪些。
 - 日志/报错：先定位服务、最近日志、错误关键词和时间范围；输出证据后再建议修复。
 用中文，简洁。`;
@@ -92,9 +96,11 @@ function splitBlocks(text: string): { code: boolean; content: string }[] {
   return parts;
 }
 
-function extractAgentCommand(text: string): string | null {
-  const block = splitBlocks(text).find((b) => b.code && b.content.trim());
-  return block?.content.trim() || null;
+function extractAgentCommands(text: string): string[] {
+  return splitBlocks(text)
+    .filter((b) => b.code && b.content.trim())
+    .map((b) => b.content.trim())
+    .slice(0, AGENT_MAX_COMMANDS_PER_BATCH);
 }
 
 /** 行内 markdown：**粗体** 与 `行内代码` */
@@ -175,6 +181,48 @@ function formatOutputLabel(chars: number, truncated: boolean): string {
   return `输出 ${chars}${truncated ? "+" : ""} 字符`;
 }
 
+function clipText(text: string, limit: number): { text: string; truncated: boolean } {
+  if (text.length <= limit) return { text, truncated: false };
+  return { text: `${text.slice(0, limit)}\n...[输出已截断]`, truncated: true };
+}
+
+function normalizeAgentCommand(command: string): string {
+  return command.replace(/\s+/g, " ").trim();
+}
+
+type AgentCommandResult = {
+  command: string;
+  note?: string;
+  exitCode: number | null;
+  output: string;
+  outputChars: number;
+  truncated: boolean;
+};
+
+function buildAgentFeedback(goal: string | undefined, results: AgentCommandResult[]): string {
+  const sections = results
+    .map((r, idx) => {
+      const out = r.output || "(无输出)";
+      return `【命令 ${idx + 1}/${results.length}】\n\`\`\`\n${r.command}\n\`\`\`\n${
+        r.note ? `执行说明：${r.note}\n` : ""
+      }退出码 ${r.exitCode ?? "?"}，输出：\n${out}`;
+    })
+    .join("\n\n");
+  return `${goal ? `【原始任务】\n${goal}\n\n` : ""}【Agent 执行批次结果】\n${sections}\n\n请基于以上真实输出继续推进：如果目标尚未达成，给出下一批 1 到 ${AGENT_MAX_COMMANDS_PER_BATCH} 条安全、必要、非重复的命令；如果已经足够判断，以"任务完成"开头给出结论，不要再输出命令代码块。`;
+}
+
+function buildAgentExecDetail(results: AgentCommandResult[]): { output: string; outputChars: number; truncated: boolean } {
+  const raw = results
+    .map((r, idx) => `# ${idx + 1}. ${r.command}\n退出码 ${r.exitCode ?? "?"}\n${r.output || "(无输出)"}`)
+    .join("\n\n");
+  const clipped = clipText(raw, AGENT_EXEC_DETAIL_LIMIT);
+  return {
+    output: clipped.text,
+    outputChars: results.reduce((sum, r) => sum + r.outputChars, 0),
+    truncated: clipped.truncated || results.some((r) => r.truncated),
+  };
+}
+
 function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
   let timer = 0;
   const timeout = new Promise<T>((_, reject) => {
@@ -216,6 +264,9 @@ function AgentExecSummary({ meta }: { meta: AgentExecMeta }) {
   const ok = meta.exitCode === 0;
   const outputText = meta.output || "(无输出)";
   const outputLabel = formatOutputLabel(meta.outputChars, meta.truncated);
+  const commandCount = meta.commandCount ?? 1;
+  const stateLabel = commandCount > 1 ? `已执行 ${commandCount} 条` : "已执行";
+  const commandTitle = commandCount > 1 ? meta.command.split("\n")[0] : meta.command;
 
   return (
     <div className={`agent-exec ${ok ? "ok" : "warn"}${expanded ? " open" : ""}`}>
@@ -227,9 +278,9 @@ function AgentExecSummary({ meta }: { meta: AgentExecMeta }) {
       >
         <span className="agent-exec-state">
           <span className="agent-exec-dot" />
-          已执行
+          {stateLabel}
         </span>
-        <code className="agent-exec-command">{meta.command}</code>
+        <code className="agent-exec-command">{commandTitle}</code>
         <span className="agent-exec-meta">
           退出码 {formatExitCode(meta.exitCode)} · {outputLabel}
         </span>
@@ -264,6 +315,7 @@ export default function AiPanel({
   const { confirm } = useDialogs();
   // 每个终端标签一份对话历史，按 conversationKey 存取
   const [convos, setConvos] = useState<Record<string, UiChatMessage[]>>({});
+  const convosRef = useRef<Record<string, UiChatMessage[]>>({});
   const messages = convos[conversationKey] ?? [];
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState(false);
@@ -279,12 +331,18 @@ export default function AiPanel({
   // 每个会话一条常驻 Agent 通道
   const agentIds = useRef<Record<string, string>>({});
   const agentAutoSteps = useRef<Record<string, number>>({});
+  const agentGoals = useRef<Record<string, string>>({});
+  const agentExecutedCommands = useRef<Record<string, Set<string>>>({});
   const agentRunSeq = useRef(0);
   const runningAgentKey = useRef<string | null>(null);
   const handledCloseNonce = useRef<number | null>(null);
 
   const setMessagesFor = (key: string, updater: (prev: UiChatMessage[]) => UiChatMessage[]) =>
-    setConvos((prev) => ({ ...prev, [key]: updater(prev[key] ?? []) }));
+    setConvos((prev) => {
+      const next = { ...prev, [key]: updater(prev[key] ?? []) };
+      convosRef.current = next;
+      return next;
+    });
 
   const setStreamingState = (value: boolean) => {
     streamingRef.current = value;
@@ -299,6 +357,10 @@ export default function AiPanel({
   useEffect(() => {
     agentModeRef.current = agentMode;
   }, [agentMode]);
+
+  useEffect(() => {
+    convosRef.current = convos;
+  }, [convos]);
 
   useEffect(() => {
     activeSessionIdRef.current = activeSessionId;
@@ -317,6 +379,8 @@ export default function AiPanel({
     if (runningAgentKey.current === key) runningAgentKey.current = null;
     closeAgentChannel(key);
     agentAutoSteps.current[key] = 0;
+    delete agentGoals.current[key];
+    delete agentExecutedCommands.current[key];
     setAgentBusyState(false);
   };
 
@@ -337,7 +401,11 @@ export default function AiPanel({
           delete next[key];
           changed = true;
         }
+        delete agentGoals.current[key];
+        delete agentAutoSteps.current[key];
+        delete agentExecutedCommands.current[key];
       });
+      if (changed) convosRef.current = next;
       return changed ? next : prev;
     });
   };
@@ -372,7 +440,11 @@ export default function AiPanel({
     const key = options?.key ?? conversationKey; // 锁定发起时的归属，流式中切标签也写回原会话
     const sessionId = options?.sessionId ?? activeSessionId ?? activeSessionIdRef.current;
     const useAgent = agentModeRef.current && Boolean(sessionId);
-    if (useAgent && !meta) agentAutoSteps.current[key] = 0;
+    if (useAgent && !meta) {
+      agentAutoSteps.current[key] = 0;
+      agentGoals.current[key] = userText.trim();
+      agentExecutedCommands.current[key] = new Set();
+    }
     let question = userText.trim();
     // Agent 模式不附带终端上下文（Agent 有自己的执行通道）
     if (!useAgent && includeContext) {
@@ -382,7 +454,7 @@ export default function AiPanel({
       }
     }
     const history: ChatMessage[] = [
-      ...(convos[key] ?? []).map(toChatMessage),
+      ...(convosRef.current[key] ?? []).map(toChatMessage),
       { role: "user", content: question },
     ];
     setMessagesFor(key, (prev) => [
@@ -419,10 +491,10 @@ export default function AiPanel({
           setStreamingState(false);
         } else if (e.type === "done") {
           setStreamingState(false);
-          const command = useAgent ? extractAgentCommand(assistantText) : null;
-          if (command && agentModeRef.current && sessionId) {
+          const commands = useAgent ? extractAgentCommands(assistantText) : [];
+          if (commands.length > 0 && agentModeRef.current && sessionId) {
             window.setTimeout(() => {
-              void runAgentStep(command, { key, sessionId, auto: true });
+              void runAgentBatch(commands, { key, sessionId, auto: true });
             }, 0);
           }
         }
@@ -451,12 +523,21 @@ export default function AiPanel({
     if (streamingRef.current || agentBusyRef.current) return;
     const key = conversationKey;
     resetAgentChannel(key);
-    setConvos((prev) => ({ ...prev, [key]: [] }));
+    setConvos((prev) => {
+      const next = { ...prev, [key]: [] };
+      convosRef.current = next;
+      return next;
+    });
   };
 
-  /** Agent 模式：执行 AI 给出的这一步命令，把结果喂回 AI 决定下一步 */
-  const runAgentStep = async (command: string, options?: AgentStepOptions) => {
+  /** Agent 模式：执行 AI 给出的一批命令，把结果汇总喂回 AI 决定下一步 */
+  const runAgentBatch = async (commandInput: string[] | string, options?: AgentStepOptions) => {
     if (streamingRef.current || agentBusyRef.current) return;
+    const commands = (Array.isArray(commandInput) ? commandInput : [commandInput])
+      .map((c) => c.trim())
+      .filter(Boolean)
+      .slice(0, AGENT_MAX_COMMANDS_PER_BATCH);
+    if (commands.length === 0) return;
     const key = options?.key ?? conversationKey;
     const sessionId = options?.sessionId ?? activeSessionId ?? activeSessionIdRef.current;
     if (!sessionId) {
@@ -472,26 +553,7 @@ export default function AiPanel({
       if (steps > AGENT_MAX_AUTO_STEPS) {
         setMessagesFor(key, (prev) => [
           ...prev,
-          { role: "assistant", content: `[Agent] 已连续智能执行 ${AGENT_MAX_AUTO_STEPS} 步，为避免误操作已暂停。需要继续请重新发送任务或关闭后再开启 Agent。` },
-        ]);
-        return;
-      }
-    }
-    const prepared = prepareAgentCommand(command);
-    const commandToRun = prepared.command;
-    // 危险命令二次确认
-    const verdict = checkDangerous(commandToRun);
-    if (verdict.danger) {
-      const ok = await confirm({
-        title: "⚠ Agent 危险命令确认",
-        message: `Agent 准备执行：\n\n${commandToRun}\n\n风险：${verdict.reason}\n\n确认让它执行吗？`,
-        danger: true,
-        okText: "确认执行",
-      });
-      if (!ok) {
-        setMessagesFor(key, (prev) => [
-          ...prev,
-          { role: "assistant", content: `[Agent] 已取消危险命令执行：${commandToRun}` },
+          { role: "assistant", content: `[Agent] 已连续执行 ${AGENT_MAX_AUTO_STEPS} 轮，为避免误操作已暂停。需要继续请重新发送任务或关闭后再开启 Agent。` },
         ]);
         return;
       }
@@ -514,30 +576,93 @@ export default function AiPanel({
         }
         agentIds.current[key] = aid;
       }
-      const result = await withTimeout(
-        api.agentRun(aid, commandToRun),
-        AGENT_RUN_TIMEOUT_MS,
-        "Agent 执行超时，已重置执行通道。请确认命令会自动结束后再重试。"
-      );
-      if (runSeq !== agentRunSeq.current) {
-        if (runningAgentKey.current === key) runningAgentKey.current = null;
-        return;
+      const results: AgentCommandResult[] = [];
+      const executedCommands = agentExecutedCommands.current[key] ?? new Set<string>();
+      agentExecutedCommands.current[key] = executedCommands;
+      for (const rawCommand of commands) {
+        const prepared = prepareAgentCommand(rawCommand);
+        const commandToRun = prepared.command;
+        const signature = normalizeAgentCommand(commandToRun);
+        if (executedCommands.has(signature)) {
+          results.push({
+            command: commandToRun,
+            note: "该命令在当前任务中已经执行过，已跳过以避免重复探测。",
+            exitCode: 0,
+            output: "已跳过重复命令。",
+            outputChars: 0,
+            truncated: false,
+          });
+          continue;
+        }
+        const verdict = checkDangerous(commandToRun);
+        if (verdict.danger) {
+          const ok = await confirm({
+            title: "⚠ Agent 危险命令确认",
+            message: `Agent 准备执行：\n\n${commandToRun}\n\n风险：${verdict.reason}\n\n确认让它执行吗？`,
+            danger: true,
+            okText: "确认执行",
+          });
+          if (!ok) {
+            results.push({
+              command: commandToRun,
+              note: "用户取消了危险命令，本批次后续命令未执行。",
+              exitCode: null,
+              output: "已取消执行。",
+              outputChars: 0,
+              truncated: false,
+            });
+            break;
+          }
+        }
+        try {
+          const result = await withTimeout(
+            api.agentRun(aid, commandToRun),
+            AGENT_RUN_TIMEOUT_MS,
+            "Agent 执行超时，已重置执行通道。请确认命令会自动结束后再重试。"
+          );
+          if (runSeq !== agentRunSeq.current) {
+            if (runningAgentKey.current === key) runningAgentKey.current = null;
+            return;
+          }
+          const rawOutput = result.output;
+          const clipped = clipText(rawOutput || "(无输出)", AGENT_OUTPUT_PER_COMMAND_LIMIT);
+          executedCommands.add(signature);
+          results.push({
+            command: commandToRun,
+            note: prepared.note,
+            exitCode: result.exitCode,
+            output: clipped.text,
+            outputChars: rawOutput.length,
+            truncated: clipped.truncated,
+          });
+        } catch (err) {
+          executedCommands.add(signature);
+          closeAgentChannel(key);
+          results.push({
+            command: commandToRun,
+            note: "命令执行失败，本批次后续命令未执行；Agent 通道已重置。",
+            exitCode: null,
+            output: String(err),
+            outputChars: String(err).length,
+            truncated: false,
+          });
+          break;
+        }
       }
-      const rawOutput = result.output;
-      const truncated = rawOutput.length > 4000;
-      const out = rawOutput.slice(0, 4000) || "(无输出)";
-      const feedback = `【Agent 执行结果】\n\`\`\`\n${commandToRun}\n\`\`\`\n${
-        prepared.note ? `执行说明：${prepared.note}\n` : ""
-      }退出码 ${result.exitCode ?? "?"}，输出：\n${out}\n\n请基于以上真实输出继续推进：如果目标尚未达成，给出下一条安全的只读探测或必要操作命令；如果已经足够判断，以"任务完成"开头给出结论，不要再输出命令代码块。`;
+      const feedback = buildAgentFeedback(agentGoals.current[key], results);
+      const detail = buildAgentExecDetail(results);
+      const firstProblem = results.find((r) => r.exitCode !== 0);
+      const worstExitCode = firstProblem ? firstProblem.exitCode : 0;
       setAgentBusyState(false);
       if (runningAgentKey.current === key) runningAgentKey.current = null;
       await send(feedback, {
         kind: "agent-exec",
-        command: commandToRun,
-        exitCode: result.exitCode,
-        output: rawOutput.slice(0, 4000),
-        outputChars: rawOutput.length,
-        truncated,
+        command: results.map((r) => r.command).join("\n"),
+        commandCount: results.length,
+        exitCode: worstExitCode,
+        output: detail.output,
+        outputChars: detail.outputChars,
+        truncated: detail.truncated,
       }, { key, sessionId }); // 结果喂回 AI，产生下一步
     } catch (e) {
       if (runSeq !== agentRunSeq.current) {
