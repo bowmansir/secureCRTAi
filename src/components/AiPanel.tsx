@@ -53,12 +53,19 @@ const AGENT_RUN_TIMEOUT_MS = 35_000;
 const AGENT_MAX_AUTO_STEPS = 12;
 
 const AGENT_SYSTEM_PROMPT = `你是 TermAI 的运维 Agent，在用户的真实服务器上分步执行任务。
-工作方式：
-1. 用户给你一个目标。你每次只输出【下一条】要执行的命令，放在单独的 \`\`\` 代码块里（一个代码块只放一条命令）。
-2. 命令应尽量非交互、可自动结束；查看实时状态时优先用 top -b -n 1、timeout 8s tail -f ... 这类有限运行形式。若输出了常驻/全屏命令，Agent 会限时自动中断收口。
-3. 安全命令会自动执行，无需用户逐步确认；危险操作（删除/重启/权限变更/安装软件/覆盖配置）必须先明确警告。
-4. 命令执行后其"退出码 + 输出"会作为下一条消息发回给你，你据此分析并决定下一步。
-5. 目标达成时，回复以"任务完成"开头给出简明结论，且【不要】再输出任何命令代码块。
+核心原则：
+1. 不要把自己当聊天问答助手，要像资深运维一样先收集证据、再判断、再行动。
+2. 用户目标即使比较宽泛，也优先执行安全的只读探测命令，不要一上来要求用户细化。只有会修改系统、会部署/删除/重启、或确实无法确定目标对象时才追问。
+3. 每次只输出【下一条】命令，放在单独的 \`\`\` 代码块里（一个代码块只放一条命令）。代码块外用一句话说明为什么执行它。
+4. 命令必须非交互、可自动结束；实时/全屏命令要改成有限运行形式，例如 top -b -n 1、timeout 8s tail -f ...。
+5. 安全命令会自动执行；危险操作（删除/重启/权限变更/安装软件/覆盖配置）必须先明确警告，系统会要求用户确认。
+6. 命令执行后其"退出码 + 输出"会作为下一条消息发回给你，你要继续基于证据推进，不要重复问同一个问题。
+7. 目标达成时，回复以"任务完成"开头给出简明结论，且【不要】再输出任何命令代码块。
+
+常见任务策略：
+- 性能/卡顿/负载问题：默认依次检查 uptime、CPU/内存/top、磁盘空间、磁盘 IO、网络连接、关键错误日志；不要先追问"具体性能目标"。
+- 部署服务：先发现当前目录、常见项目文件、systemd 服务、Docker/Compose、运行进程和监听端口；若用户说"所有"，理解为"把当前机器上可识别的服务都盘点出来"，先只读盘点，再让用户确认要部署哪些。
+- 日志/报错：先定位服务、最近日志、错误关键词和时间范围；输出证据后再建议修复。
 用中文，简洁。`;
 
 const SYSTEM_PROMPT = `你是 TermAI 内置的运维终端助手。用户正在使用一个远程终端（SSH 或本地 PowerShell）。
@@ -519,9 +526,9 @@ export default function AiPanel({
       const rawOutput = result.output;
       const truncated = rawOutput.length > 4000;
       const out = rawOutput.slice(0, 4000) || "(无输出)";
-      const feedback = `【已执行】\n\`\`\`\n${commandToRun}\n\`\`\`\n${
+      const feedback = `【Agent 执行结果】\n\`\`\`\n${commandToRun}\n\`\`\`\n${
         prepared.note ? `执行说明：${prepared.note}\n` : ""
-      }退出码 ${result.exitCode ?? "?"}，输出：\n${out}`;
+      }退出码 ${result.exitCode ?? "?"}，输出：\n${out}\n\n请基于以上真实输出继续推进：如果目标尚未达成，给出下一条安全的只读探测或必要操作命令；如果已经足够判断，以"任务完成"开头给出结论，不要再输出命令代码块。`;
       setAgentBusyState(false);
       if (runningAgentKey.current === key) runningAgentKey.current = null;
       await send(feedback, {
@@ -622,17 +629,9 @@ export default function AiPanel({
               ) : (
                 splitBlocks(m.content).map((b, j) =>
                   b.code ? (
-                      <div key={j} className="code-block">
+                      <div key={j} className={`code-block${agentMode ? " agent-code" : ""}`}>
                         <pre>{b.content}</pre>
-                        {agentMode ? (
-                          <button
-                            className="btn mini primary"
-                            disabled
-                            title="Agent 模式会自动执行安全命令，危险命令会弹窗确认"
-                          >
-                            {agentBusy && i === messages.length - 1 ? "执行中..." : "智能执行"}
-                          </button>
-                        ) : (
+                        {!agentMode && (
                           <button
                             className="btn mini"
                             onClick={() => insertCommand(b.content)}

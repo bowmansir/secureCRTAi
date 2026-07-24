@@ -1316,13 +1316,13 @@ body,
   background: var(--bg-code);
   border: 1px solid var(--border);
   border-radius: 6px;
-  margin: 6px 0;
+  margin: 8px 0;
   position: relative;
 }
 
 .code-block pre {
   margin: 0;
-  padding: 8px 10px 26px;
+  padding: 9px 12px 28px;
   font-family: var(--mono-font);
   font-size: 12px;
   overflow-x: auto;
@@ -1334,6 +1334,34 @@ body,
   position: absolute;
   right: 6px;
   bottom: 6px;
+}
+
+.code-block.agent-code {
+  margin: 10px 6px;
+  border-color: rgba(88, 166, 255, 0.22);
+  background:
+    linear-gradient(90deg, rgba(88, 166, 255, 0.08), transparent 42%),
+    var(--bg-code);
+}
+
+.code-block.agent-code::before {
+  content: "command";
+  position: absolute;
+  top: -7px;
+  left: 10px;
+  padding: 0 5px;
+  background: var(--bg-hover);
+  color: var(--text-dim);
+  font-size: 10px;
+  line-height: 1;
+  letter-spacing: 0;
+}
+
+.code-block.agent-code pre {
+  padding: 14px 16px;
+  color: var(--text);
+  white-space: pre;
+  word-break: normal;
 }
 
 .agent-exec {
