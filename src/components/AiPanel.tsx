@@ -38,14 +38,26 @@ type UiChatMessage = ChatMessage & {
   meta?: AgentExecMeta;
 };
 
+type AgentStepOptions = {
+  key?: string;
+  sessionId?: string;
+  auto?: boolean;
+};
+
+type SendOptions = {
+  key?: string;
+  sessionId?: string;
+};
+
 const AGENT_RUN_TIMEOUT_MS = 35_000;
+const AGENT_MAX_AUTO_STEPS = 12;
 
 const AGENT_SYSTEM_PROMPT = `你是 TermAI 的运维 Agent，在用户的真实服务器上分步执行任务。
 工作方式：
 1. 用户给你一个目标。你每次只输出【下一条】要执行的命令，放在单独的 \`\`\` 代码块里（一个代码块只放一条命令）。
 2. 命令应尽量非交互、可自动结束；查看实时状态时优先用 top -b -n 1、timeout 8s tail -f ... 这类有限运行形式。若输出了常驻/全屏命令，Agent 会限时自动中断收口。
-3. 命令执行后其"退出码 + 输出"会作为下一条消息发回给你，你据此分析并决定下一步。
-4. 每条命令前用一句话说明目的。危险操作（删除/重启/权限变更）必须先明确警告。
+3. 安全命令会自动执行，无需用户逐步确认；危险操作（删除/重启/权限变更/安装软件/覆盖配置）必须先明确警告。
+4. 命令执行后其"退出码 + 输出"会作为下一条消息发回给你，你据此分析并决定下一步。
 5. 目标达成时，回复以"任务完成"开头给出简明结论，且【不要】再输出任何命令代码块。
 用中文，简洁。`;
 
@@ -71,6 +83,11 @@ function splitBlocks(text: string): { code: boolean; content: string }[] {
   }
   if (last < text.length) parts.push({ code: false, content: text.slice(last) });
   return parts;
+}
+
+function extractAgentCommand(text: string): string | null {
+  const block = splitBlocks(text).find((b) => b.code && b.content.trim());
+  return block?.content.trim() || null;
 }
 
 /** 行内 markdown：**粗体** 与 `行内代码` */
@@ -248,14 +265,37 @@ export default function AiPanel({
   const [agentBusy, setAgentBusy] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const abortRef = useRef(false);
+  const streamingRef = useRef(false);
+  const agentBusyRef = useRef(false);
+  const agentModeRef = useRef(false);
+  const activeSessionIdRef = useRef<string | undefined>(activeSessionId);
   // 每个会话一条常驻 Agent 通道
   const agentIds = useRef<Record<string, string>>({});
+  const agentAutoSteps = useRef<Record<string, number>>({});
   const agentRunSeq = useRef(0);
   const runningAgentKey = useRef<string | null>(null);
   const handledCloseNonce = useRef<number | null>(null);
 
   const setMessagesFor = (key: string, updater: (prev: UiChatMessage[]) => UiChatMessage[]) =>
     setConvos((prev) => ({ ...prev, [key]: updater(prev[key] ?? []) }));
+
+  const setStreamingState = (value: boolean) => {
+    streamingRef.current = value;
+    setStreaming(value);
+  };
+
+  const setAgentBusyState = (value: boolean) => {
+    agentBusyRef.current = value;
+    setAgentBusy(value);
+  };
+
+  useEffect(() => {
+    agentModeRef.current = agentMode;
+  }, [agentMode]);
+
+  useEffect(() => {
+    activeSessionIdRef.current = activeSessionId;
+  }, [activeSessionId]);
 
   const closeAgentChannel = (key: string) => {
     const aid = agentIds.current[key];
@@ -269,7 +309,8 @@ export default function AiPanel({
     agentRunSeq.current += 1;
     if (runningAgentKey.current === key) runningAgentKey.current = null;
     closeAgentChannel(key);
-    setAgentBusy(false);
+    agentAutoSteps.current[key] = 0;
+    setAgentBusyState(false);
   };
 
   const disposeConversationKeys = (keys: string[]) => {
@@ -278,7 +319,7 @@ export default function AiPanel({
     if (runningAgentKey.current && keySet.has(runningAgentKey.current)) {
       agentRunSeq.current += 1;
       runningAgentKey.current = null;
-      setAgentBusy(false);
+      setAgentBusyState(false);
     }
     keySet.forEach(closeAgentChannel);
     setConvos((prev) => {
@@ -313,15 +354,21 @@ export default function AiPanel({
 
   const stop = () => {
     abortRef.current = true;
-    setStreaming(false);
+    agentRunSeq.current += 1;
+    runningAgentKey.current = null;
+    setAgentBusyState(false);
+    setStreamingState(false);
   };
 
-  const send = async (userText: string, meta?: AgentExecMeta) => {
-    if (!userText.trim() || streaming) return;
-    const key = conversationKey; // 锁定发起时的归属，流式中切标签也写回原会话
+  const send = async (userText: string, meta?: AgentExecMeta, options?: SendOptions) => {
+    if (!userText.trim() || streamingRef.current || agentBusyRef.current) return;
+    const key = options?.key ?? conversationKey; // 锁定发起时的归属，流式中切标签也写回原会话
+    const sessionId = options?.sessionId ?? activeSessionId ?? activeSessionIdRef.current;
+    const useAgent = agentModeRef.current && Boolean(sessionId);
+    if (useAgent && !meta) agentAutoSteps.current[key] = 0;
     let question = userText.trim();
     // Agent 模式不附带终端上下文（Agent 有自己的执行通道）
-    if (!agentMode && includeContext) {
+    if (!useAgent && includeContext) {
       const ctx = getRecentOutput().trim();
       if (ctx) {
         question = `【终端最近输出，供参考】\n${ctx.slice(-4000)}\n\n【用户问题】\n${userText.trim()}`;
@@ -338,12 +385,13 @@ export default function AiPanel({
     ]);
     setInput("");
     abortRef.current = false;
-    setStreaming(true);
+    setStreamingState(true);
 
     // 环境信息注入 system prompt；Agent 模式用 Agent 提示词
     const env = getEnv().trim();
-    const base = agentMode ? AGENT_SYSTEM_PROMPT : SYSTEM_PROMPT;
+    const base = useAgent ? AGENT_SYSTEM_PROMPT : SYSTEM_PROMPT;
     const sys = env ? `${base}\n\n【当前服务器环境】\n${env}` : base;
+    let assistantText = "";
 
     const appendToLast = (extra: string) =>
       setMessagesFor(key, (prev) => {
@@ -355,15 +403,26 @@ export default function AiPanel({
     try {
       await api.aiChat(sys, history, (e) => {
         if (abortRef.current) return;
-        if (e.type === "delta") appendToLast(e.text);
+        if (e.type === "delta") {
+          assistantText += e.text;
+          appendToLast(e.text);
+        }
         else if (e.type === "error") {
           appendToLast(`\n[错误] ${e.message}`);
-          setStreaming(false);
-        } else if (e.type === "done") setStreaming(false);
+          setStreamingState(false);
+        } else if (e.type === "done") {
+          setStreamingState(false);
+          const command = useAgent ? extractAgentCommand(assistantText) : null;
+          if (command && agentModeRef.current && sessionId) {
+            window.setTimeout(() => {
+              void runAgentStep(command, { key, sessionId, auto: true });
+            }, 0);
+          }
+        }
       });
     } catch (err) {
       appendToLast(`\n[错误] ${String(err)}`);
-      setStreaming(false);
+      setStreamingState(false);
     }
   };
 
@@ -382,23 +441,35 @@ export default function AiPanel({
   };
 
   const clearConversation = () => {
-    if (streaming) return;
+    if (streamingRef.current || agentBusyRef.current) return;
     const key = conversationKey;
     resetAgentChannel(key);
     setConvos((prev) => ({ ...prev, [key]: [] }));
   };
 
   /** Agent 模式：执行 AI 给出的这一步命令，把结果喂回 AI 决定下一步 */
-  const runAgentStep = async (command: string) => {
-    if (streaming || agentBusy) return;
-    if (!activeSessionId) {
-      setMessagesFor(conversationKey, (prev) => [
+  const runAgentStep = async (command: string, options?: AgentStepOptions) => {
+    if (streamingRef.current || agentBusyRef.current) return;
+    const key = options?.key ?? conversationKey;
+    const sessionId = options?.sessionId ?? activeSessionId ?? activeSessionIdRef.current;
+    if (!sessionId) {
+      setMessagesFor(key, (prev) => [
         ...prev,
         { role: "assistant", content: "[Agent] 需要在一个 SSH 会话标签下才能执行命令。" },
       ]);
       return;
     }
-    const key = conversationKey;
+    if (options?.auto) {
+      const steps = (agentAutoSteps.current[key] ?? 0) + 1;
+      agentAutoSteps.current[key] = steps;
+      if (steps > AGENT_MAX_AUTO_STEPS) {
+        setMessagesFor(key, (prev) => [
+          ...prev,
+          { role: "assistant", content: `[Agent] 已连续智能执行 ${AGENT_MAX_AUTO_STEPS} 步，为避免误操作已暂停。需要继续请重新发送任务或关闭后再开启 Agent。` },
+        ]);
+        return;
+      }
+    }
     const prepared = prepareAgentCommand(command);
     const commandToRun = prepared.command;
     // 危险命令二次确认
@@ -410,16 +481,22 @@ export default function AiPanel({
         danger: true,
         okText: "确认执行",
       });
-      if (!ok) return;
+      if (!ok) {
+        setMessagesFor(key, (prev) => [
+          ...prev,
+          { role: "assistant", content: `[Agent] 已取消危险命令执行：${commandToRun}` },
+        ]);
+        return;
+      }
     }
     const runSeq = ++agentRunSeq.current;
     runningAgentKey.current = key;
-    setAgentBusy(true);
+    setAgentBusyState(true);
     try {
       let aid = agentIds.current[key];
       if (!aid) {
         aid = await withTimeout(
-          api.agentOpen(activeSessionId),
+          api.agentOpen(sessionId),
           AGENT_RUN_TIMEOUT_MS,
           "Agent 连接超时，已取消本次执行。"
         );
@@ -445,7 +522,7 @@ export default function AiPanel({
       const feedback = `【已执行】\n\`\`\`\n${commandToRun}\n\`\`\`\n${
         prepared.note ? `执行说明：${prepared.note}\n` : ""
       }退出码 ${result.exitCode ?? "?"}，输出：\n${out}`;
-      setAgentBusy(false);
+      setAgentBusyState(false);
       if (runningAgentKey.current === key) runningAgentKey.current = null;
       await send(feedback, {
         kind: "agent-exec",
@@ -454,14 +531,14 @@ export default function AiPanel({
         output: rawOutput.slice(0, 4000),
         outputChars: rawOutput.length,
         truncated,
-      }); // 结果喂回 AI，产生下一步
+      }, { key, sessionId }); // 结果喂回 AI，产生下一步
     } catch (e) {
       if (runSeq !== agentRunSeq.current) {
         if (runningAgentKey.current === key) runningAgentKey.current = null;
         return;
       }
       closeAgentChannel(key);
-      setAgentBusy(false);
+      setAgentBusyState(false);
       if (runningAgentKey.current === key) runningAgentKey.current = null;
       setMessagesFor(key, (prev) => [
         ...prev,
@@ -494,7 +571,7 @@ export default function AiPanel({
             className={`ctx-toggle agent-toggle${agentMode ? " on" : ""}`}
             title={
               activeSessionId
-                ? "Agent 模式：AI 分步在当前 SSH 会话执行命令（每步确认）"
+                ? "Agent 模式：点一次发送后智能连续执行，危险命令会二次确认"
                 : "Agent 模式需要在 SSH 会话标签下使用"
             }
           >
@@ -503,6 +580,7 @@ export default function AiPanel({
                 checked={agentMode}
                 disabled={!activeSessionId}
                 onChange={(e) => {
+                  agentModeRef.current = e.target.checked;
                   resetAgentChannel(conversationKey);
                   setAgentMode(e.target.checked);
                 }}
@@ -515,7 +593,7 @@ export default function AiPanel({
               上下文
             </label>
           )}
-          <button className="icon-btn" title="清空当前会话对话" onClick={clearConversation} disabled={streaming}>
+          <button className="icon-btn" title="清空当前会话对话" onClick={clearConversation} disabled={streaming || agentBusy}>
             <Icon name="trash" size={14} />
           </button>
         </div>
@@ -546,14 +624,13 @@ export default function AiPanel({
                   b.code ? (
                       <div key={j} className="code-block">
                         <pre>{b.content}</pre>
-                        {agentMode && i === messages.length - 1 && !streaming ? (
+                        {agentMode ? (
                           <button
                             className="btn mini primary"
-                            onClick={() => runAgentStep(b.content)}
-                            disabled={agentBusy}
-                            title="让 Agent 执行这一步并根据输出继续"
+                            disabled
+                            title="Agent 模式会自动执行安全命令，危险命令会弹窗确认"
                           >
-                            {agentBusy ? "执行中..." : "执行一步"}
+                            {agentBusy && i === messages.length - 1 ? "执行中..." : "智能执行"}
                           </button>
                         ) : (
                           <button
@@ -580,10 +657,10 @@ export default function AiPanel({
         })}
       </div>
       <div className="ai-quick">
-        <button className="btn mini" onClick={diagnose} disabled={streaming}>
+        <button className="btn mini" onClick={diagnose} disabled={streaming || agentBusy}>
           诊断最近报错
         </button>
-        <button className="btn mini" onClick={() => send("解释终端最近输出的含义。")} disabled={streaming}>
+        <button className="btn mini" onClick={() => send("解释终端最近输出的含义。")} disabled={streaming || agentBusy}>
           解释输出
         </button>
       </div>
@@ -593,7 +670,7 @@ export default function AiPanel({
           rows={2}
           placeholder="描述任务或提问，例如：查看占用 8080 端口的进程"
           value={input}
-          disabled={streaming}
+          disabled={streaming || agentBusy}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={(e) => {
             if (e.key === "Enter" && !e.shiftKey) {
@@ -609,7 +686,7 @@ export default function AiPanel({
               ■ 停止
             </button>
           ) : (
-            <button className="btn primary send-btn" onClick={() => send(input)} disabled={!input.trim()}>
+            <button className="btn primary send-btn" onClick={() => send(input)} disabled={!input.trim() || agentBusy}>
               发送 ➤
             </button>
           )}
