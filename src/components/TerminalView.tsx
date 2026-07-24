@@ -270,6 +270,8 @@ export default function TerminalView({
       }
 
       if (ev.key === "Tab" && !ev.ctrlKey && !ev.altKey && !ev.metaKey) {
+        ev.preventDefault();
+        ev.stopPropagation();
         const id = termIdRef.current;
         if (id) api.termWrite(id, "\t").catch(() => {});
         return false;

@@ -422,6 +422,8 @@ export default function SftpCliView({ tab, active, theme, onStatus, startTransfe
         return false;
       }
       if (ev.key === "Tab" && !ev.ctrlKey && !ev.altKey && !ev.metaKey) {
+        ev.preventDefault();
+        ev.stopPropagation();
         void completePath();
         return false;
       }
