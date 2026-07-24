@@ -169,23 +169,30 @@ function AppInner() {
         },
         ...prev,
       ]);
+      let finalized = false;
       const patch = (p: Partial<TransferItem>) =>
         setTransfers((prev) => prev.map((t) => (t.id === localId ? { ...t, ...p } : t)));
+      const finish = (p: Partial<TransferItem>) => {
+        if (finalized) return;
+        finalized = true;
+        patch(p);
+      };
 
       api
         .transferStart(sftpId, kind, local, remote, (e) => {
+          if (finalized) return;
           if (e.type === "started") patch({ totalBytes: e.totalBytes });
           else if (e.type === "file") patch({ currentFile: e.name });
           else if (e.type === "progress") patch({ transferred: e.transferred, rateBps: e.rateBps });
           else if (e.type === "done") {
-            patch({ status: "done", transferred: e.transferred, doneFiles: e.files, rateBps: 0 });
+            finish({ status: "done", transferred: e.transferred, doneFiles: e.files, rateBps: 0 });
             onDone?.();
           }
-          else if (e.type === "cancelled") patch({ status: "cancelled", rateBps: 0 });
-          else if (e.type === "error") patch({ status: "error", message: e.message, rateBps: 0 });
+          else if (e.type === "cancelled") finish({ status: "cancelled", rateBps: 0 });
+          else if (e.type === "error") finish({ status: "error", message: e.message, rateBps: 0 });
         })
         .then((backendId) => patch({ backendId }))
-        .catch((err) => patch({ status: "error", message: String(err) }));
+        .catch((err) => finish({ status: "error", message: String(err), rateBps: 0 }));
     },
     []
   );
@@ -215,22 +222,29 @@ function AppInner() {
         },
         ...prev,
       ]);
+      let finalized = false;
       const patch = (p: Partial<TransferItem>) =>
         setTransfers((prev) => prev.map((t) => (t.id === localId ? { ...t, ...p } : t)));
+      const finish = (p: Partial<TransferItem>) => {
+        if (finalized) return;
+        finalized = true;
+        patch(p);
+      };
       api
         .transferRemote(srcSftpId, srcPath, dstSessionId, dstPath, (e) => {
+          if (finalized) return;
           if (e.type === "started") patch({ totalBytes: e.totalBytes });
           else if (e.type === "file") patch({ currentFile: e.name });
           else if (e.type === "progress") patch({ transferred: e.transferred, rateBps: e.rateBps });
           else if (e.type === "done") {
-            patch({ status: "done", transferred: e.transferred, doneFiles: e.files, rateBps: 0 });
+            finish({ status: "done", transferred: e.transferred, doneFiles: e.files, rateBps: 0 });
             onDone?.();
           }
-          else if (e.type === "cancelled") patch({ status: "cancelled", rateBps: 0 });
-          else if (e.type === "error") patch({ status: "error", message: e.message, rateBps: 0 });
+          else if (e.type === "cancelled") finish({ status: "cancelled", rateBps: 0 });
+          else if (e.type === "error") finish({ status: "error", message: e.message, rateBps: 0 });
         })
         .then((backendId) => patch({ backendId }))
-        .catch((err) => patch({ status: "error", message: String(err) }));
+        .catch((err) => finish({ status: "error", message: String(err), rateBps: 0 }));
     },
     []
   );

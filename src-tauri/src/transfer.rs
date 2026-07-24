@@ -1,6 +1,5 @@
 //! 传输引擎：队列、进度/速率事件、目录递归、取消。
-//! 同名等大文件跳过（增量同步），其余覆盖重传；不做按大小猜测的断点续传
-//! （那会拼出损坏文件）。真正的续传需配合校验，留待队列持久化时一并做对。
+//! 同名等大文件跳过（增量同步）；大文件按现有目标大小续传，完成后再校验目标大小。
 
 use crate::sftp::SftpConn;
 use anyhow::{anyhow, bail, Context};
@@ -150,6 +149,31 @@ fn resume_offset(source_size: u64, target_size: u64) -> Option<u64> {
     }
 }
 
+async fn verify_remote_size(conn: &SftpConn, path: &str, expected: u64) -> anyhow::Result<()> {
+    let actual = conn
+        .sftp
+        .metadata(path.to_string())
+        .await
+        .with_context(|| format!("校验远程文件失败: {path}"))?
+        .size
+        .unwrap_or(0);
+    if actual != expected {
+        bail!("远程文件大小校验失败: {path}，期望 {expected} B，实际 {actual} B");
+    }
+    Ok(())
+}
+
+async fn verify_local_size(path: &str, expected: u64) -> anyhow::Result<()> {
+    let actual = tokio::fs::metadata(path)
+        .await
+        .with_context(|| format!("校验本地文件失败: {path}"))?
+        .len();
+    if actual != expected {
+        bail!("本地文件大小校验失败: {path}，期望 {expected} B，实际 {actual} B");
+    }
+    Ok(())
+}
+
 /// 传输入口：kind = "upload" | "download"，自动识别文件/目录。
 pub async fn run(
     conn: Arc<SftpConn>,
@@ -294,8 +318,9 @@ async fn remote_copy(
             .context("写入目标服务器失败")?;
         progress.add(n as u64);
     }
-    wf.flush().await.ok();
-    wf.shutdown().await.ok();
+    wf.flush().await.context("刷新目标服务器文件失败")?;
+    wf.shutdown().await.context("关闭目标服务器文件失败")?;
+    verify_remote_size(dst, dst_path, size).await?;
     Ok((progress.transferred, 1))
 }
 
@@ -392,8 +417,9 @@ async fn remote_copy_entry(
                 .context("写入目标服务器失败")?;
             progress.add(n as u64);
         }
-        wf.flush().await.ok();
-        wf.shutdown().await.ok();
+        wf.flush().await.context("刷新目标服务器文件失败")?;
+        wf.shutdown().await.context("关闭目标服务器文件失败")?;
+        verify_remote_size(dst, &dpath, size).await?;
         done_files += 1;
     }
     Ok((progress.transferred, done_files))
@@ -473,8 +499,7 @@ async fn upload_entry(
         let name = display_name(&lpath);
         let _ = events.send(TransferEvent::File { name: name.clone() });
 
-        // 目标已存在且等大：视为已传，跳过（增量同步）。其余一律覆盖重传，
-        // 不做按大小猜测的断点续传（会拼出损坏文件）。
+        // 目标已存在且等大：视为已传，跳过（增量同步）。大文件目标较小时从断点续传。
         let existing_size = if size > 0 {
             conn.sftp
                 .metadata(rpath.clone())
@@ -524,8 +549,9 @@ async fn upload_entry(
             rf.write_all(&buf[..n]).await.context("写入远程失败")?;
             progress.add(n as u64);
         }
-        rf.flush().await.ok();
-        rf.shutdown().await.ok();
+        rf.flush().await.context("刷新远程文件失败")?;
+        rf.shutdown().await.context("关闭远程文件失败")?;
+        verify_remote_size(conn, &rpath, size).await?;
         done_files += 1;
     }
     Ok((progress.transferred, done_files))
@@ -606,7 +632,7 @@ async fn download_entry(
         let name = display_name(&rpath);
         let _ = events.send(TransferEvent::File { name: name.clone() });
 
-        // 目标已存在且等大则跳过，其余覆盖重传（不做按大小猜测的续传）
+        // 目标已存在且等大则跳过；大文件目标较小时从断点续传。
         let existing_size = if size > 0 {
             tokio::fs::metadata(&lpath).await.ok().map(|m| m.len())
         } else {
@@ -658,7 +684,8 @@ async fn download_entry(
             lf.write_all(&buf[..n]).await.context("写入本地失败")?;
             progress.add(n as u64);
         }
-        lf.flush().await.ok();
+        lf.flush().await.context("刷新本地文件失败")?;
+        verify_local_size(&lpath, size).await?;
         done_files += 1;
     }
     Ok((progress.transferred, done_files))
@@ -779,6 +806,24 @@ mod resume_smoke_tests {
         Ok(())
     }
 
+    fn start_tiny_upload_sftp_container(name: &str, port: u16) -> anyhow::Result<()> {
+        let port_map = format!("127.0.0.1:{port}:22");
+        docker(vec![
+            "run".into(),
+            "-d".into(),
+            "--rm".into(),
+            "--name".into(),
+            name.to_string(),
+            "-p".into(),
+            port_map,
+            "--mount".into(),
+            "type=tmpfs,destination=/home/termai/upload,tmpfs-size=64k".into(),
+            "atmoz/sftp:latest".into(),
+            format!("{USER}:{PASS}:::upload"),
+        ])?;
+        Ok(())
+    }
+
     fn prepare_source_files(container: &str) -> anyhow::Result<()> {
         let base = format!("/home/{USER}/upload");
         let command = format!(
@@ -888,6 +933,20 @@ mod resume_smoke_tests {
         );
     }
 
+    fn assert_finished(events: &Arc<Mutex<Vec<SeenEvent>>>, label: &str, expected: u64) {
+        let snapshot = events.lock().clone();
+        assert!(
+            !snapshot.iter().any(|event| event.kind == "error"),
+            "{label} transfer emitted error: {snapshot:?}"
+        );
+        assert!(
+            snapshot
+                .iter()
+                .any(|event| event.kind == "done" && event.transferred == Some(expected)),
+            "{label} transfer did not finish at expected size: {snapshot:?}"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "requires Docker and TERMAI_RESUME_SMOKE=1"]
     async fn resumes_large_remote_file_and_directory_transfers() -> anyhow::Result<()> {
@@ -945,6 +1004,104 @@ mod resume_smoke_tests {
         );
         assert_resumed(&dir_events, "directory");
 
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires Docker and TERMAI_TRANSFER_SMOKE=1"]
+    async fn uploads_and_downloads_file_with_verified_size() -> anyhow::Result<()> {
+        if std::env::var("TERMAI_TRANSFER_SMOKE").ok().as_deref() != Some("1") {
+            eprintln!("skipped; set TERMAI_TRANSFER_SMOKE=1 to run the Docker smoke test");
+            return Ok(());
+        }
+
+        let (port, _) = free_ports()?;
+        let suffix = std::process::id();
+        let name = format!("termai-transfer-{suffix}");
+        let _guard = DockerGuard::new(vec![name.clone()]);
+
+        start_sftp_container(&name, port)?;
+        let conn = open_sftp(port).await?;
+
+        let upload_local = std::env::temp_dir().join(format!("termai-upload-{suffix}.txt"));
+        let download_local = std::env::temp_dir().join(format!("termai-download-{suffix}.txt"));
+        let content = b"termai verified transfer\n";
+        std::fs::write(&upload_local, content)?;
+
+        let upload_events = Arc::new(Mutex::new(Vec::new()));
+        run(
+            conn.clone(),
+            "upload".to_string(),
+            upload_local.to_string_lossy().to_string(),
+            "/upload/verified.txt".to_string(),
+            Arc::new(AtomicBool::new(false)),
+            event_channel(upload_events.clone()),
+        )
+        .await;
+        assert_eq!(
+            remote_size(&name, &format!("/home/{USER}/upload/verified.txt"))?,
+            content.len() as u64
+        );
+        assert_finished(&upload_events, "upload", content.len() as u64);
+
+        let download_events = Arc::new(Mutex::new(Vec::new()));
+        run(
+            conn,
+            "download".to_string(),
+            download_local.to_string_lossy().to_string(),
+            "/upload/verified.txt".to_string(),
+            Arc::new(AtomicBool::new(false)),
+            event_channel(download_events.clone()),
+        )
+        .await;
+        assert_eq!(std::fs::read(&download_local)?, content);
+        assert_finished(&download_events, "download", content.len() as u64);
+
+        let _ = std::fs::remove_file(upload_local);
+        let _ = std::fs::remove_file(download_local);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires Docker and TERMAI_FULL_UPLOAD_SMOKE=1"]
+    async fn reports_error_when_remote_upload_cannot_store_file() -> anyhow::Result<()> {
+        if std::env::var("TERMAI_FULL_UPLOAD_SMOKE").ok().as_deref() != Some("1") {
+            eprintln!("skipped; set TERMAI_FULL_UPLOAD_SMOKE=1 to run the Docker smoke test");
+            return Ok(());
+        }
+
+        let (port, _) = free_ports()?;
+        let suffix = std::process::id();
+        let name = format!("termai-full-upload-{suffix}");
+        let _guard = DockerGuard::new(vec![name.clone()]);
+
+        start_tiny_upload_sftp_container(&name, port)?;
+        let conn = open_sftp(port).await?;
+
+        let local = std::env::temp_dir().join(format!("termai-full-upload-{suffix}.bin"));
+        std::fs::File::create(&local)?.set_len(1024 * 1024)?;
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        run(
+            conn,
+            "upload".to_string(),
+            local.to_string_lossy().to_string(),
+            "/upload/full.bin".to_string(),
+            Arc::new(AtomicBool::new(false)),
+            event_channel(events.clone()),
+        )
+        .await;
+        let _ = std::fs::remove_file(local);
+
+        let snapshot = events.lock().clone();
+        assert!(
+            snapshot.iter().any(|event| event.kind == "error"),
+            "full remote upload did not emit error: {snapshot:?}"
+        );
+        assert!(
+            !snapshot.iter().any(|event| event.kind == "done"),
+            "full remote upload must not emit done: {snapshot:?}"
+        );
         Ok(())
     }
 }

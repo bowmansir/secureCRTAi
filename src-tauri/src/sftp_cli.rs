@@ -32,7 +32,8 @@ const HELP: &str = "\
   put <本地文件> [远程名]   上传（同上）
   mkdir <路径>     远程建目录          rm <文件>   删除远程文件
   rmdir <目录>     删除远程空目录      mv <旧> <新> 重命名
-  clear            清屏                help        帮助";
+  clear            清屏                help        帮助
+提示：Tab 可补全当前命令参数中的文件名/目录名。";
 
 fn join_remote(cwd: &str, p: &str) -> String {
     if p.starts_with('/') {

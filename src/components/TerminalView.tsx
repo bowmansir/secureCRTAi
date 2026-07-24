@@ -269,6 +269,12 @@ export default function TerminalView({
         return false;
       }
 
+      if (ev.key === "Tab" && !ev.ctrlKey && !ev.altKey && !ev.metaKey) {
+        const id = termIdRef.current;
+        if (id) api.termWrite(id, "\t").catch(() => {});
+        return false;
+      }
+
       if ((ev.ctrlKey || ev.metaKey) && key === "f") {
         setSearchOpen(true);
         setTimeout(() => searchInputRef.current?.focus(), 0);
