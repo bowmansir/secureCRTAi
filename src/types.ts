@@ -26,8 +26,21 @@ export interface SessionInput {
 }
 
 export type TermEvent =
-  | { type: "data"; bytes: number[] }
+  | { type: "data"; bytes: number[]; commandId?: string | null }
   | { type: "connected" }
+  | {
+      type: "shellIntegration";
+      available: boolean;
+      shell: string | null;
+    }
+  | { type: "shellCommand"; commandId: string; command: string }
+  | {
+      type: "shellPrompt";
+      commandId?: string | null;
+      cwd: string;
+      exitCode: number;
+      command: string | null;
+    }
   | { type: "exit"; message: string | null };
 
 export type AiEvent =
@@ -193,4 +206,30 @@ export interface TransferItem {
   rateBps: number;
   currentFile: string;
   message?: string;
+}
+
+export interface ThemePackView {
+  id: string;
+  displayName: string;
+  description: string;
+  mode: string;
+  hasArt: boolean;
+  hasPreview: boolean;
+}
+
+export interface ThemeLibraryView {
+  root: string;
+  themes: ThemePackView[];
+}
+
+export interface ThemeAssetView {
+  mimeType: string;
+  base64: string;
+}
+
+export type AppTheme = "dark" | "midnight" | "light";
+
+export interface ThemePreferencesView {
+  colorTheme: AppTheme;
+  backgroundThemeId: string | null;
 }

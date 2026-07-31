@@ -1,3 +1,4 @@
+use super::integration::{IntegrationEvent, ParsedItem, ShellIntegrationParser};
 use super::{TermEvent, TermSession};
 use crate::hostkeys::HostKeyStore;
 use anyhow::{anyhow, bail, Context};
@@ -282,6 +283,10 @@ pub async fn open(
         .request_pty(false, "xterm-256color", cols as u32, rows as u32, 0, 0, &[])
         .await?;
     channel.request_shell(false).await?;
+    let integration_nonce = uuid::Uuid::new_v4().simple().to_string();
+    let integration_bootstrap = shell_integration_bootstrap(&integration_nonce);
+    let integration_body = shell_integration_body(&integration_nonce);
+    channel.data(integration_bootstrap.as_bytes()).await?;
 
     let (tx, mut rx) = mpsc::unbounded_channel::<TermCmd>();
     let events = on_event.clone();
@@ -289,8 +294,23 @@ pub async fn open(
     tauri::async_runtime::spawn(async move {
         // handle 必须存活到会话结束，移入任务持有
         let _handle = handle;
+        let mut parser = ShellIntegrationParser::new(&integration_nonce);
+        let integration_deadline = tokio::time::sleep(std::time::Duration::from_secs(3));
+        tokio::pin!(integration_deadline);
+        let mut integration_pending = true;
+        let mut integration_buffer = Vec::new();
+        let mut install_body_sent = false;
+        let mut active_command_id = None;
         loop {
             tokio::select! {
+                _ = &mut integration_deadline, if integration_pending => {
+                    integration_pending = false;
+                    flush_integration_buffer(&mut integration_buffer, &events, false);
+                    let _ = events.send(TermEvent::ShellIntegration {
+                        available: false,
+                        shell: None,
+                    });
+                }
                 cmd = rx.recv() => match cmd {
                     Some(TermCmd::Write(data)) => {
                         if channel.data(&data[..]).await.is_err() {
@@ -307,10 +327,34 @@ pub async fn open(
                 },
                 msg = channel.wait() => match msg {
                     Some(ChannelMsg::Data { data }) => {
-                        let _ = events.send(TermEvent::Data { bytes: data.to_vec() });
+                        let bootstrap_ready = forward_terminal_items(
+                            parser.feed(&data),
+                            &events,
+                            &mut integration_pending,
+                            &mut integration_buffer,
+                            &mut active_command_id,
+                        );
+                        if bootstrap_ready && !install_body_sent {
+                            if channel.data(integration_body.as_bytes()).await.is_err() {
+                                break;
+                            }
+                            install_body_sent = true;
+                        }
                     }
                     Some(ChannelMsg::ExtendedData { data, .. }) => {
-                        let _ = events.send(TermEvent::Data { bytes: data.to_vec() });
+                        let bootstrap_ready = forward_terminal_items(
+                            parser.feed(&data),
+                            &events,
+                            &mut integration_pending,
+                            &mut integration_buffer,
+                            &mut active_command_id,
+                        );
+                        if bootstrap_ready && !install_body_sent {
+                            if channel.data(integration_body.as_bytes()).await.is_err() {
+                                break;
+                            }
+                            install_body_sent = true;
+                        }
                     }
                     Some(ChannelMsg::ExitStatus { .. }) | Some(ChannelMsg::Close) | Some(ChannelMsg::Eof) | None => {
                         break;
@@ -319,6 +363,14 @@ pub async fn open(
                 },
             }
         }
+        flush_integration_buffer(&mut integration_buffer, &events, false);
+        let pending = parser.finish();
+        if !pending.is_empty() {
+            let _ = events.send(TermEvent::Data {
+                bytes: pending,
+                command_id: active_command_id.clone(),
+            });
+        }
         let _ = events.send(TermEvent::Exit {
             message: Some("SSH 连接已断开".to_string()),
         });
@@ -326,4 +378,237 @@ pub async fn open(
 
     let _ = on_event.send(TermEvent::Connected);
     Ok(Arc::new(SshTermSession { tx }))
+}
+
+const SHELL_INTEGRATION_NONCE_PLACEHOLDER: &str = "__TERMAI_NONCE__";
+const SHELL_INTEGRATION_BOOTSTRAP_TEMPLATE: &str =
+    " stty -echo 2>/dev/null; printf '\\033]633;TermAI;__TERMAI_NONCE__;B\\007'\r";
+
+const SHELL_INTEGRATION_BODY_TEMPLATE: &str = concat!(
+    "__termai_emit_command(){ ",
+    "__termai_cmd=${1:-}; ",
+    "if [ -z \"$__termai_cmd\" ]; then ",
+    "__termai_cmd=$(history 1 2>/dev/null | sed 's/^ *[0-9][0-9]* *//'); fi; ",
+    "__termai_cmd_b64=$(printf '%s' \"$__termai_cmd\" | base64 2>/dev/null | tr -d '\\r\\n'); ",
+    "printf '\\033]633;TermAI;__TERMAI_NONCE__;C;%s\\007' \"$__termai_cmd_b64\"; }; ",
+    "__termai_emit_prompt(){ __termai_prompt_status=$?; ",
+    "__termai_status=${__termai_status_captured:-$__termai_prompt_status}; ",
+    "unset __termai_status_captured; ",
+    "__termai_cwd=$(printf '%s' \"$PWD\" | base64 2>/dev/null | tr -d '\\r\\n'); ",
+    "printf '\\033]633;TermAI;__TERMAI_NONCE__;P;%s;%s;\\007' \"$__termai_status\" \"$__termai_cwd\"; ",
+    "__termai_preexec_armed=1; ",
+    "return \"$__termai_status\"; }; ",
+    "__termai_emit_preexec(){ __termai_debug_status=$?; ",
+    "if [ \"${__termai_preexec_armed:-0}\" = 1 ]; then ",
+    "__termai_preexec_armed=0; unset __termai_status_captured; ",
+    "__termai_emit_command \"${1:-}\"; ",
+    "elif [ -z \"${__termai_status_captured+x}\" ]; then ",
+    "__termai_status_captured=$__termai_debug_status; fi; }; ",
+    "__termai_preexec_armed=0; ",
+    "if [ -n \"${BASH_VERSION:-}\" ]; then ",
+    "if [ -z \"$(trap -p DEBUG 2>/dev/null)\" ]; then ",
+    "PROMPT_COMMAND=\"${PROMPT_COMMAND:+$PROMPT_COMMAND;}__termai_emit_prompt\"; ",
+    "__termai_shell=bash; trap '__termai_emit_preexec' DEBUG; ",
+    "else __termai_shell=raw; fi; ",
+    "elif [ -n \"${ZSH_VERSION:-}\" ]; then ",
+    "autoload -Uz add-zsh-hook 2>/dev/null && ",
+    "add-zsh-hook precmd __termai_emit_prompt && ",
+    "add-zsh-hook preexec __termai_emit_preexec; ",
+    "__termai_shell=zsh; ",
+    "else __termai_shell=raw; fi; ",
+    "printf '\\033]633;TermAI;__TERMAI_NONCE__;H;%s\\007' \"$__termai_shell\"; ",
+    "stty echo 2>/dev/null; true\r"
+);
+
+fn shell_integration_bootstrap(nonce: &str) -> String {
+    SHELL_INTEGRATION_BOOTSTRAP_TEMPLATE.replace(SHELL_INTEGRATION_NONCE_PLACEHOLDER, nonce)
+}
+
+fn shell_integration_body(nonce: &str) -> String {
+    SHELL_INTEGRATION_BODY_TEMPLATE.replace(SHELL_INTEGRATION_NONCE_PLACEHOLDER, nonce)
+}
+
+fn forward_terminal_items(
+    items: Vec<ParsedItem>,
+    events: &tauri::ipc::Channel<TermEvent>,
+    integration_pending: &mut bool,
+    integration_buffer: &mut Vec<u8>,
+    active_command_id: &mut Option<String>,
+) -> bool {
+    let mut bootstrap_ready = false;
+    for item in items {
+        let event = match item {
+            ParsedItem::Data(bytes) if *integration_pending => {
+                integration_buffer.extend(bytes);
+                continue;
+            }
+            ParsedItem::Data(bytes) => TermEvent::Data {
+                bytes,
+                command_id: active_command_id.clone(),
+            },
+            ParsedItem::Event(IntegrationEvent::BootstrapReady) => {
+                bootstrap_ready = true;
+                continue;
+            }
+            ParsedItem::Event(IntegrationEvent::Ready { shell }) => {
+                flush_integration_buffer(integration_buffer, events, true);
+                *integration_pending = false;
+                TermEvent::ShellIntegration {
+                    available: true,
+                    shell: Some(shell),
+                }
+            }
+            ParsedItem::Event(IntegrationEvent::Unavailable) => {
+                flush_integration_buffer(integration_buffer, events, true);
+                *integration_pending = false;
+                TermEvent::ShellIntegration {
+                    available: false,
+                    shell: None,
+                }
+            }
+            ParsedItem::Event(IntegrationEvent::CommandStart { command }) => {
+                let command_id = begin_shell_command(active_command_id);
+                TermEvent::ShellCommand {
+                    command_id,
+                    command,
+                }
+            }
+            ParsedItem::Event(IntegrationEvent::Prompt {
+                cwd,
+                exit_code,
+                command,
+            }) => {
+                let command_id = finish_shell_command(active_command_id);
+                TermEvent::ShellPrompt {
+                    command_id,
+                    cwd,
+                    exit_code,
+                    command,
+                }
+            }
+        };
+        let _ = events.send(event);
+    }
+    bootstrap_ready
+}
+
+fn begin_shell_command(active_command_id: &mut Option<String>) -> String {
+    let command_id = uuid::Uuid::new_v4().to_string();
+    *active_command_id = Some(command_id.clone());
+    command_id
+}
+
+fn finish_shell_command(active_command_id: &mut Option<String>) -> Option<String> {
+    active_command_id.take()
+}
+
+fn flush_integration_buffer(
+    integration_buffer: &mut Vec<u8>,
+    events: &tauri::ipc::Channel<TermEvent>,
+    integration_completed: bool,
+) {
+    if integration_buffer.is_empty() {
+        return;
+    }
+    let mut bytes = strip_integration_install_echo(std::mem::take(integration_buffer));
+    if integration_completed {
+        strip_intermediate_install_prompt(&mut bytes);
+    }
+    if !bytes.is_empty() {
+        let _ = events.send(TermEvent::Data {
+            bytes,
+            command_id: None,
+        });
+    }
+}
+
+fn strip_integration_install_echo(mut bytes: Vec<u8>) -> Vec<u8> {
+    const COMMAND: &[u8] = b"stty -echo 2>/dev/null";
+    while let Some(command_start) = bytes
+        .windows(COMMAND.len())
+        .position(|window| window == COMMAND)
+    {
+        let line_start = bytes[..command_start]
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |index| index + 1);
+        let line_end = bytes[command_start + COMMAND.len()..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(bytes.len(), |offset| {
+                command_start + COMMAND.len() + offset + 1
+        });
+        bytes.drain(line_start..line_end);
+    }
+    bytes
+}
+
+fn strip_intermediate_install_prompt(bytes: &mut Vec<u8>) {
+    let line_start = bytes
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |index| index + 1);
+    let line = &bytes[line_start..];
+    if line_start == 0 || line.len() > 2048 {
+        return;
+    }
+    if line
+        .iter()
+        .any(|byte| matches!(*byte, b'#' | b'$' | b'>' | b'%'))
+    {
+        bytes.truncate(line_start);
+    }
+}
+
+#[cfg(test)]
+mod integration_echo_tests {
+    use super::{
+        begin_shell_command, finish_shell_command, strip_integration_install_echo,
+        strip_intermediate_install_prompt,
+    };
+
+    #[test]
+    fn hides_only_the_internal_install_command_from_the_login_screen() {
+        let input = b"Welcome\r\n[root@host ~]# stty -echo 2>/dev/null\r\n".to_vec();
+        assert_eq!(strip_integration_install_echo(input), b"Welcome\r\n");
+    }
+
+    #[test]
+    fn keeps_unrelated_terminal_output_unchanged() {
+        let input = b"Welcome\r\n[root@host ~]# uptime\r\n".to_vec();
+        assert_eq!(strip_integration_install_echo(input.clone()), input);
+    }
+
+    #[test]
+    fn removes_the_intermediate_prompt_after_integration_is_ready() {
+        let mut buffered = concat!(
+            "Welcome\r\n",
+            "[root@host ~]# stty -echo 2>/dev/null\r\n",
+            "\x1b[01;32m[root@host ~]#\x1b[0m "
+        )
+        .as_bytes()
+        .to_vec();
+        buffered = strip_integration_install_echo(buffered);
+        strip_intermediate_install_prompt(&mut buffered);
+        assert_eq!(buffered, b"Welcome\r\n");
+    }
+
+    #[test]
+    fn keeps_the_intermediate_prompt_when_integration_did_not_complete() {
+        let input = b"Welcome\r\n[root@host ~]# ".to_vec();
+        assert_eq!(strip_integration_install_echo(input.clone()), input);
+    }
+
+    #[test]
+    fn keeps_one_stable_command_id_until_the_prompt_finishes_it() {
+        let mut active_command_id = None;
+        let first = begin_shell_command(&mut active_command_id);
+        assert_eq!(active_command_id.as_deref(), Some(first.as_str()));
+        assert_eq!(finish_shell_command(&mut active_command_id), Some(first));
+        assert!(active_command_id.is_none());
+
+        let second = begin_shell_command(&mut active_command_id);
+        assert_eq!(active_command_id.as_deref(), Some(second.as_str()));
+        assert_ne!(finish_shell_command(&mut active_command_id), None);
+    }
 }

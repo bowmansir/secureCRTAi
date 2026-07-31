@@ -16,8 +16,40 @@ import type {
   SftpOpenResult,
   Snippet,
   TermEvent,
+  ThemeAssetView,
+  ThemeLibraryView,
+  ThemePreferencesView,
   TransferEvent,
 } from "./types";
+
+// ---------- 主题 ----------
+
+export function themeList(): Promise<ThemeLibraryView> {
+  return invoke("theme_list");
+}
+
+export function themeLoadAsset(
+  themeId: string,
+  kind: "art" | "preview"
+): Promise<ThemeAssetView> {
+  return invoke("theme_load_asset", { themeId, kind });
+}
+
+export function themeOpenFolder(): Promise<void> {
+  return invoke("theme_open_folder");
+}
+
+export function themeGetPreferences(): Promise<ThemePreferencesView | null> {
+  return invoke("theme_get_preferences");
+}
+
+export function themeSetColor(colorTheme: ThemePreferencesView["colorTheme"]): Promise<ThemePreferencesView> {
+  return invoke("theme_set_color", { colorTheme });
+}
+
+export function themeSetBackground(themeId: string | null): Promise<ThemePreferencesView> {
+  return invoke("theme_set_background", { themeId });
+}
 
 // ---------- 终端 ----------
 
@@ -60,6 +92,10 @@ export function agentRun(
   return invoke("agent_run", { id, command });
 }
 
+export function agentInterrupt(id: string): Promise<void> {
+  return invoke("agent_interrupt", { id });
+}
+
 export function agentClose(id: string): Promise<void> {
   return invoke("agent_close", { id });
 }
@@ -86,6 +122,14 @@ export function sftpOpen(sessionId: string): Promise<SftpOpenResult> {
 
 export function sftpList(id: string, path: string): Promise<FileEntry[]> {
   return invoke("sftp_list", { id, path });
+}
+
+export function sftpReadText(
+  id: string,
+  remote: string,
+  maxBytes = 32_000
+): Promise<string> {
+  return invoke("sftp_read_text", { id, remote, maxBytes });
 }
 
 export function sftpDownload(id: string, remote: string, local: string): Promise<void> {
@@ -379,9 +423,35 @@ export function aiSetActive(id: string): Promise<void> {
 export function aiChat(
   system: string | null,
   messages: ChatMessage[],
-  onEvent: (e: AiEvent) => void
+  onEvent: (e: AiEvent) => void,
+  signal?: AbortSignal
 ): Promise<void> {
+  if (signal?.aborted) {
+    return Promise.reject(createAbortError());
+  }
+  const requestId = crypto.randomUUID();
   const ch = new Channel<AiEvent>();
   ch.onmessage = onEvent;
-  return invoke("ai_chat", { system, messages, onEvent: ch });
+  const request = invoke<void>("ai_chat", {
+    requestId,
+    system,
+    messages,
+    onEvent: ch,
+  });
+  if (!signal) return request;
+
+  const cancel = () => {
+    void invoke<boolean>("ai_cancel", { requestId });
+  };
+  signal.addEventListener("abort", cancel, { once: true });
+  return request.finally(() => {
+    signal.removeEventListener("abort", cancel);
+    if (signal.aborted) throw createAbortError();
+  });
+}
+
+function createAbortError(): Error {
+  const error = new Error("AI request cancelled");
+  error.name = "AbortError";
+  return error;
 }

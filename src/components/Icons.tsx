@@ -16,8 +16,10 @@ export type IconName =
   | "folderSync"
   | "local"
   | "plus"
+  | "refresh"
   | "settings"
   | "split"
+  | "terminal"
   | "tools"
   | "trash"
   | "transfer"
@@ -46,8 +48,10 @@ const PATHS: Record<IconName, string> = {
   folderSync: "M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v3M7 17H3v-6a2 2 0 0 1 2-2h15M16 14h5v5M21 14l-6 6M8 21H3v-5M3 21l6-6",
   local: "M4 5h16v10H4zM8 19h8M12 15v4",
   plus: "M12 5v14M5 12h14",
+  refresh: "M20 6v5h-5M4 18v-5h5M18.5 10a7 7 0 0 0-12-3L4 11M5.5 14a7 7 0 0 0 12 3L20 13",
   settings: "M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8zM4 12h2M18 12h2M12 4v2M12 18v2M5.6 5.6L7 7M17 17l1.4 1.4M18.4 5.6L17 7M7 17l-1.4 1.4",
   split: "M4 5h16v14H4zM12 5v14M4 12h16",
+  terminal: "M4 5h16v14H4zM8 9l3 3-3 3M13 15h4",
   tools: "M14.5 5.5a3.5 3.5 0 0 1 4.6 4.6l-9 9-4.6-4.6 9-9zM4 20l2-2M14 6l4 4",
   trash: "M4 7h16M10 11v6M14 11v6M6 7l1 14h10l1-14M9 7V4h6v3",
   transfer: "M7 7h13M17 4l3 3-3 3M17 17H4M7 14l-3 3 3 3",

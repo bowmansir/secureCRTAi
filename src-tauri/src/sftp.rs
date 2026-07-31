@@ -9,6 +9,7 @@ use russh_sftp::client::SftpSession;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::io::AsyncReadExt;
 
 pub struct SftpConn {
     /// 连接句柄必须与 SftpSession 一同存活
@@ -98,6 +99,48 @@ pub async fn list_dir(conn: &SftpConn, path: &str) -> anyhow::Result<Vec<FileEnt
     Ok(out)
 }
 
+pub async fn read_text_preview(
+    conn: &SftpConn,
+    remote: &str,
+    max_bytes: usize,
+) -> anyhow::Result<String> {
+    let mut remote_file = conn
+        .sftp
+        .open(remote)
+        .await
+        .with_context(|| format!("打开远程文件失败: {remote}"))?;
+    let mut bytes = Vec::with_capacity(max_bytes.saturating_add(1));
+    (&mut remote_file)
+        .take(max_bytes.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)
+        .await
+        .with_context(|| format!("读取远程文件失败: {remote}"))?;
+    decode_text_preview(bytes, max_bytes)
+}
+
+fn decode_text_preview(mut bytes: Vec<u8>, max_bytes: usize) -> anyhow::Result<String> {
+    let truncated = bytes.len() > max_bytes;
+    if truncated {
+        bytes.truncate(max_bytes);
+    }
+    if bytes.contains(&0) {
+        anyhow::bail!("文件包含二进制内容，不能作为 Agent 文本上下文");
+    }
+
+    let mut text = match std::str::from_utf8(&bytes) {
+        Ok(value) => value.to_owned(),
+        Err(error) if truncated && error.error_len().is_none() => {
+            String::from_utf8(bytes[..error.valid_up_to()].to_vec())
+                .expect("UTF-8 valid prefix must decode")
+        }
+        Err(_) => anyhow::bail!("文件不是有效的 UTF-8 文本，不能作为 Agent 上下文"),
+    };
+    if truncated {
+        text.push_str("\n\n[文件内容已按上下文上限截断]");
+    }
+    Ok(text)
+}
+
 pub async fn download(conn: &SftpConn, remote: &str, local: &str) -> anyhow::Result<()> {
     let mut rf = conn
         .sftp
@@ -111,6 +154,37 @@ pub async fn download(conn: &SftpConn, remote: &str, local: &str) -> anyhow::Res
         .await
         .context("下载失败")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_text_preview;
+
+    #[test]
+    fn decodes_utf8_text_without_changes() {
+        assert_eq!(
+            decode_text_preview("hello 世界".as_bytes().to_vec(), 32).unwrap(),
+            "hello 世界"
+        );
+    }
+
+    #[test]
+    fn truncates_on_a_valid_utf8_boundary() {
+        let preview = decode_text_preview("ab世界".as_bytes().to_vec(), 4).unwrap();
+        assert_eq!(preview, "ab\n\n[文件内容已按上下文上限截断]");
+    }
+
+    #[test]
+    fn rejects_binary_and_invalid_utf8_files() {
+        assert!(decode_text_preview(vec![b'a', 0, b'b'], 32)
+            .unwrap_err()
+            .to_string()
+            .contains("二进制"));
+        assert!(decode_text_preview(vec![0xff, 0xfe], 32)
+            .unwrap_err()
+            .to_string()
+            .contains("UTF-8"));
+    }
 }
 
 pub async fn upload(conn: &SftpConn, local: &str, remote: &str) -> anyhow::Result<()> {

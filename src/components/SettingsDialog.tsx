@@ -3,18 +3,23 @@ import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialo
 import * as api from "../api";
 import { useDialogs } from "./Dialogs";
 import Icon from "./Icons";
-import type { AiConfigView, ProviderKind, ProviderView } from "../types";
+import type {
+  AiConfigView,
+  AppTheme,
+  ProviderKind,
+  ProviderView,
+} from "../types";
 
 interface Props {
   theme: AppTheme;
-  onThemeChange: (theme: AppTheme) => void;
+  onThemeChange: (theme: AppTheme) => Promise<void>;
+  backgroundThemeId: string | null;
+  onBackgroundThemeChange: (themeId: string | null) => Promise<void>;
   onClose: () => void;
   onChanged: () => void;
   /** 导入配置后刷新会话列表等 */
   onImported: () => void;
 }
-
-type AppTheme = "dark" | "midnight" | "light";
 
 const KIND_PRESETS: Record<ProviderKind, { label: string; baseUrl: string; model: string; needKey: boolean }> = {
   anthropic: { label: "Anthropic Claude", baseUrl: "https://api.anthropic.com", model: "claude-sonnet-5", needKey: true },
@@ -29,7 +34,76 @@ const THEME_OPTIONS: Array<{ value: AppTheme; label: string; note: string }> = [
   { value: "light", label: "浅色", note: "白天环境更清楚" },
 ];
 
-export default function SettingsDialog({ theme, onThemeChange, onClose, onChanged, onImported }: Props) {
+function LazyThemePreview({
+  themeId,
+  revision,
+}: {
+  themeId: string;
+  revision: number;
+}) {
+  const previewRef = useRef<HTMLSpanElement>(null);
+  const [source, setSource] = useState<string | null>(null);
+
+  useEffect(() => {
+    const element = previewRef.current;
+    if (!element) return;
+    let cancelled = false;
+    let started = false;
+
+    const load = () => {
+      if (started) return;
+      started = true;
+      void api
+        .themeLoadAsset(themeId, "preview")
+        .then((asset) => {
+          if (!cancelled) {
+            setSource(`data:${asset.mimeType};base64,${asset.base64}`);
+          }
+        })
+        .catch(() => {});
+    };
+
+    if (!("IntersectionObserver" in window)) {
+      load();
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) {
+          load();
+          observer.disconnect();
+        }
+      },
+      { rootMargin: "180px" }
+    );
+    observer.observe(element);
+    return () => {
+      cancelled = true;
+      observer.disconnect();
+    };
+  }, [revision, themeId]);
+
+  return (
+    <span
+      ref={previewRef}
+      className={`custom-theme-preview${source ? " loaded" : ""}`}
+      style={source ? { backgroundImage: `url("${source}")` } : undefined}
+    />
+  );
+}
+
+export default function SettingsDialog({
+  theme,
+  onThemeChange,
+  backgroundThemeId,
+  onBackgroundThemeChange,
+  onClose,
+  onChanged,
+  onImported,
+}: Props) {
   const { prompt: dialogPrompt } = useDialogs();
   const [ioMessage, setIoMessage] = useState("");
   const [config, setConfig] = useState<AiConfigView | null>(null);
@@ -45,6 +119,12 @@ export default function SettingsDialog({ theme, onThemeChange, onClose, onChange
   const [error, setError] = useState("");
   const [saving, setSaving] = useState(false);
   const apiKeyRef = useRef<HTMLInputElement>(null);
+  const themeLoadSeq = useRef(0);
+  const [themeLibrary, setThemeLibrary] = useState<Awaited<ReturnType<typeof api.themeList>> | null>(null);
+  const [themePreviewRevision, setThemePreviewRevision] = useState(0);
+  const [themeMessage, setThemeMessage] = useState("");
+  const [themesLoading, setThemesLoading] = useState(false);
+  const [themeSaving, setThemeSaving] = useState(false);
 
   const reload = async () => {
     const cfg = await api.aiGetConfig();
@@ -55,6 +135,53 @@ export default function SettingsDialog({ theme, onThemeChange, onClose, onChange
   useEffect(() => {
     reload();
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const saveColorTheme = async (nextTheme: AppTheme) => {
+    setThemeSaving(true);
+    setThemeMessage("");
+    try {
+      await onThemeChange(nextTheme);
+    } catch (error) {
+      setThemeMessage(`保存主题配置失败: ${String(error)}`);
+    } finally {
+      setThemeSaving(false);
+    }
+  };
+
+  const saveBackgroundTheme = async (themeId: string | null) => {
+    setThemeSaving(true);
+    setThemeMessage("");
+    try {
+      await onBackgroundThemeChange(themeId);
+    } catch (error) {
+      setThemeMessage(`保存图片主题配置失败: ${String(error)}`);
+    } finally {
+      setThemeSaving(false);
+    }
+  };
+
+  const reloadThemes = async () => {
+    const seq = ++themeLoadSeq.current;
+    setThemesLoading(true);
+    setThemeMessage("");
+    try {
+      const library = await api.themeList();
+      if (seq !== themeLoadSeq.current) return;
+      setThemeLibrary(library);
+      setThemePreviewRevision((revision) => revision + 1);
+    } catch (error) {
+      if (seq === themeLoadSeq.current) setThemeMessage(String(error));
+    } finally {
+      if (seq === themeLoadSeq.current) setThemesLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    void reloadThemes();
+    return () => {
+      themeLoadSeq.current += 1;
+    };
   }, []);
 
   const startCreate = () => {
@@ -169,7 +296,8 @@ export default function SettingsDialog({ theme, onThemeChange, onClose, onChange
                   <button
                     key={option.value}
                     className={`theme-option${theme === option.value ? " active" : ""}`}
-                    onClick={() => onThemeChange(option.value)}
+                    onClick={() => void saveColorTheme(option.value)}
+                    disabled={themeSaving}
                     type="button"
                     role="radio"
                     aria-checked={theme === option.value}
@@ -186,6 +314,79 @@ export default function SettingsDialog({ theme, onThemeChange, onClose, onChange
                   </button>
                 ))}
               </div>
+            </div>
+            <div className="settings-section">
+              <div className="custom-theme-head">
+                <div>
+                  <div className="settings-section-title">图片背景</div>
+                  <small>{themeLibrary?.root ?? "~/.codexthemes/themes"}</small>
+                </div>
+                <div className="custom-theme-actions">
+                  <button
+                    className="icon-btn"
+                    type="button"
+                    title="打开主题目录"
+                    onClick={() => void api.themeOpenFolder()}
+                  >
+                    <Icon name="folder" size={15} />
+                  </button>
+                  <button
+                    className="icon-btn"
+                    type="button"
+                    title="刷新主题"
+                    disabled={themesLoading}
+                    onClick={() => void reloadThemes()}
+                  >
+                    <Icon name="refresh" size={15} />
+                  </button>
+                </div>
+              </div>
+              <div className="custom-theme-grid" role="radiogroup" aria-label="图片背景">
+                <button
+                  className={`custom-theme-card${backgroundThemeId === null ? " active" : ""}`}
+                  type="button"
+                  role="radio"
+                  aria-checked={backgroundThemeId === null}
+                  disabled={themeSaving}
+                  onClick={() => void saveBackgroundTheme(null)}
+                >
+                  <span className="custom-theme-preview empty" />
+                  <span className="custom-theme-copy">
+                    <strong>无背景</strong>
+                    <small>保持当前纯色主题</small>
+                  </span>
+                </button>
+                {themeLibrary?.themes
+                  .filter((item) => item.hasArt)
+                  .map((item) => (
+                    <button
+                      key={item.id}
+                      className={`custom-theme-card${
+                        backgroundThemeId === item.id ? " active" : ""
+                      }`}
+                      type="button"
+                      role="radio"
+                      aria-checked={backgroundThemeId === item.id}
+                      disabled={themeSaving}
+                      onClick={() => void saveBackgroundTheme(item.id)}
+                    >
+                      <LazyThemePreview
+                        themeId={item.id}
+                        revision={themePreviewRevision}
+                      />
+                      <span className="custom-theme-copy">
+                        <strong>{item.displayName}</strong>
+                        <small>{item.description || item.mode}</small>
+                      </span>
+                    </button>
+                  ))}
+              </div>
+              {!themesLoading &&
+                !themeMessage &&
+                themeLibrary?.themes.every((item) => !item.hasArt) && (
+                  <div className="custom-theme-empty">暂无图片主题</div>
+                )}
+              {themeMessage && <div className="form-error">{themeMessage}</div>}
             </div>
             <div className="settings-section-title">AI Provider</div>
             <div className="provider-list">

@@ -32,6 +32,11 @@ interface Props {
     title: string,
     onDone?: () => void
   ) => void;
+  onAttachRemoteFile: (input: {
+    sessionId: string;
+    remotePath: string;
+    content: string;
+  }) => Promise<void>;
 }
 
 function baseName(p: string): string {
@@ -69,6 +74,7 @@ export default function SftpDualView({
   startTransfer,
   sessions,
   startRemoteTransfer,
+  onAttachRemoteFile,
 }: Props) {
   const { showMenu } = useContextMenu();
   const { prompt, confirm } = useDialogs();
@@ -374,6 +380,21 @@ export default function SftpDualView({
     }
   };
 
+  const attachRemoteFile = async (side: RemoteSide, entry: FileEntry) => {
+    const ctx = remoteContext(side);
+    const sessionId =
+      side === "source" ? tab.sessionId : targetSession?.id;
+    if (!ctx.id || !sessionId || entry.isDir) return;
+    const remotePath = joinRemote(ctx.cwd, entry.name);
+    try {
+      const content = await api.sftpReadText(ctx.id, remotePath);
+      await onAttachRemoteFile({ sessionId, remotePath, content });
+      setError("");
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
   const localMkdir = async () => {
     if (!localCwd) return;
     const name = await prompt({ title: "本地新建目录", placeholder: "目录名称" });
@@ -433,6 +454,9 @@ export default function SftpDualView({
       ...(entry.isDir
         ? [{ label: "进入目录", onClick: () => refreshRemoteSide("source", joinRemote(sourceCwd, entry.name)) }]
         : []),
+      ...(!entry.isDir
+        ? [{ label: "添加到 Agent 上下文", onClick: () => attachRemoteFile("source", entry) }]
+        : []),
       SEPARATOR,
       { label: "重命名", onClick: () => remoteRename("source", entry) },
       { label: "删除", danger: true, onClick: () => remoteDelete("source", entry) },
@@ -447,6 +471,9 @@ export default function SftpDualView({
       { label: "传到右侧当前服务器", onClick: () => transferTargetToSource(entry) },
       ...(entry.isDir
         ? [{ label: "进入目录", onClick: () => refreshRemoteSide("target", joinRemote(targetCwd, entry.name)) }]
+        : []),
+      ...(!entry.isDir
+        ? [{ label: "添加到 Agent 上下文", onClick: () => attachRemoteFile("target", entry) }]
         : []),
       SEPARATOR,
       { label: "重命名", onClick: () => remoteRename("target", entry) },

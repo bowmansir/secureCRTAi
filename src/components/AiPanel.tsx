@@ -1,8 +1,31 @@
 import { useEffect, useRef, useState } from "react";
-import type { ReactNode } from "react";
 import * as api from "../api";
-import { checkDangerous } from "../dangerous";
+import { agentChannels } from "../agent/agentChannels";
+import {
+  AGENT_AUTO_STEP_CHUNK,
+  AGENT_MAX_COMMANDS_PER_BATCH,
+  AGENT_OUTPUT_PER_COMMAND_LIMIT,
+  AGENT_RUN_TIMEOUT_MS,
+  AGENT_SYSTEM_PROMPT,
+  ASSISTANT_SYSTEM_PROMPT,
+  buildAgentExecDetail,
+  buildAgentFeedback,
+  clipAgentText,
+  getAgentBatchDisposition,
+  normalizeAgentCommand,
+  prepareAgentCommand,
+} from "../agent/agentProtocol";
+import type { AgentCommandResult } from "../agent/agentProtocol";
+import { getAgentRuntimeKey } from "../agent/channelRegistry";
+import { isAiPanelAgentModeEnabled } from "../agent/aiPanelMode";
+import {
+  parseAgentActionPlan,
+  stripTypedActionEnvelopeForDisplay,
+} from "../agent/typedActions";
+import type { ShellExecuteAction } from "../agent/typedActions";
+import { ScopedRequestGate } from "../agent/requestGeneration";
 import { useDialogs } from "./Dialogs";
+import AgentMarkdown from "./AgentMarkdown";
 import Icon from "./Icons";
 import type { ChatMessage } from "../types";
 
@@ -21,12 +44,13 @@ interface Props {
   insertCommand: (cmd: string) => void;
   openSettings: () => void;
   /** 外部触发的提问（右键菜单等），nonce 变化即发送 */
-  externalRequest?: { text: string; nonce: number } | null;
+  externalRequest?: { text: string; nonce: number; useAgent?: boolean } | null;
   closeAgentRequest?: { keys: string[]; nonce: number } | null;
 }
 
 type AgentExecMeta = {
   kind: "agent-exec";
+  status: "running" | "completed" | "failed" | "cancelled" | "rejected";
   command: string;
   commandCount?: number;
   exitCode: number | null;
@@ -35,14 +59,33 @@ type AgentExecMeta = {
   truncated: boolean;
 };
 
+type AgentLimitMeta = {
+  kind: "agent-limit";
+  rounds: number;
+  status: "paused" | "continued" | "ended";
+};
+
+type AgentQueuedMeta = {
+  kind: "agent-queued";
+  status: "queued" | "applied" | "cancelled";
+};
+
 type UiChatMessage = ChatMessage & {
-  meta?: AgentExecMeta;
+  id?: string;
+  meta?: AgentExecMeta | AgentLimitMeta | AgentQueuedMeta;
 };
 
 type AgentStepOptions = {
   key?: string;
+  surfaceId?: string;
   sessionId?: string;
   auto?: boolean;
+};
+
+type AgentLimitPause = {
+  actions: ShellExecuteAction[];
+  sessionId: string;
+  surfaceId: string;
 };
 
 type SendOptions = {
@@ -50,203 +93,20 @@ type SendOptions = {
   sessionId?: string;
   useAgent?: boolean;
   env?: string;
+  appendUserMessage?: boolean;
+  resetAgentTask?: boolean;
 };
-
-const AGENT_RUN_TIMEOUT_MS = 35_000;
-const AGENT_MAX_AUTO_STEPS = 12;
-const AGENT_MAX_COMMANDS_PER_BATCH = 5;
-const AGENT_OUTPUT_PER_COMMAND_LIMIT = 2600;
-const AGENT_EXEC_DETAIL_LIMIT = 4200;
-
-const AGENT_SYSTEM_PROMPT = `你是 TermAI 的运维 Agent，在用户的真实服务器上分步执行任务。
-核心原则：
-1. 不要把自己当聊天问答助手，要像资深运维一样先收集证据、再判断、再行动。
-2. 用户目标即使比较宽泛，也优先执行安全的只读探测命令，不要一上来要求用户细化。只有会修改系统、会部署/删除/重启、或确实无法确定目标对象时才追问。
-3. 每轮先给出一句执行意图，然后输出 1 到 5 个 \`\`\` 代码块；每个代码块只放一条命令。安全、只读、互相独立的探测命令应放在同一轮执行，不要机械地一条条请求。
-4. 命令必须非交互、可自动结束；实时/全屏命令要改成有限运行形式，例如 top -b -n 1、timeout 8s tail -f ...。需要进入目录时，用 cd /path && command 这类自包含命令，不要依赖上一条命令的隐藏状态。
-5. 安全命令会自动批量执行；危险操作（删除/重启/权限变更/安装软件/覆盖配置）不要混进批量探测里，必须单独给出并先明确警告，系统会要求用户确认。
-6. 命令执行后其"退出码 + 输出"会作为下一条消息发回给你，你要继续基于证据推进。不要重复执行已经有结论的 uptime/free/top/df 等同类探测。
-7. 如果一轮批量探测已经足够判断，直接以"任务完成"开头给出结论；目标达成时【不要】再输出任何命令代码块。
-
-常见任务策略：
-- 性能/卡顿/负载问题：先组合一轮只读诊断批次，覆盖 uptime、CPU/内存/top、磁盘空间、磁盘 IO、网络连接、关键错误日志；不要拆成多个重复小步骤。
-- 部署服务：先发现当前目录、常见项目文件、systemd 服务、Docker/Compose、运行进程和监听端口；若用户说"所有"，理解为"把当前机器上可识别的服务都盘点出来"，先只读盘点，再让用户确认要部署哪些。
-- 日志/报错：先定位服务、最近日志、错误关键词和时间范围；输出证据后再建议修复。
-用中文，简洁。`;
-
-const SYSTEM_PROMPT = `你是 TermAI 内置的运维终端助手。用户正在使用一个远程终端（SSH 或本地 PowerShell）。
-规则：
-1. 回答务必简洁、面向命令行操作。
-2. 需要给出可执行命令时，用 \`\`\` 代码块单独给出，一个代码块只放一条命令，方便用户一键插入终端。
-3. 危险操作（删除、格式化、重启、权限变更）必须先警告。
-4. 用中文回答。`;
-
-// ---------- 轻量 markdown 渲染 ----------
 
 function getScopedConversationKey(key: string, useAgent: boolean): string {
   return `${useAgent ? "agent" : "chat"}:${key}`;
 }
 
-/** 按 ``` 代码块切开 */
-function splitBlocks(text: string): { code: boolean; content: string }[] {
-  const parts: { code: boolean; content: string }[] = [];
-  const re = /```[a-zA-Z0-9_-]*\n?([\s\S]*?)(```|$)/g;
-  let last = 0;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(text))) {
-    if (m.index > last) parts.push({ code: false, content: text.slice(last, m.index) });
-    parts.push({ code: true, content: m[1].replace(/\n$/, "") });
-    last = re.lastIndex;
-  }
-  if (last < text.length) parts.push({ code: false, content: text.slice(last) });
-  return parts;
+function getSurfaceIdFromConversationKey(key: string): string {
+  return key.startsWith("agent:") ? key.slice("agent:".length) : key;
 }
 
-function extractAgentCommands(text: string): string[] {
-  return splitBlocks(text)
-    .filter((b) => b.code && b.content.trim())
-    .map((b) => b.content.trim())
-    .slice(0, AGENT_MAX_COMMANDS_PER_BATCH);
-}
-
-/** 行内 markdown：**粗体** 与 `行内代码` */
-function renderInline(text: string, keyPrefix: string): ReactNode[] {
-  const nodes: ReactNode[] = [];
-  const re = /(\*\*([^*]+)\*\*|`([^`]+)`)/g;
-  let last = 0;
-  let m: RegExpExecArray | null;
-  let i = 0;
-  while ((m = re.exec(text))) {
-    if (m.index > last) nodes.push(text.slice(last, m.index));
-    if (m[2] !== undefined) nodes.push(<strong key={`${keyPrefix}-b${i}`}>{m[2]}</strong>);
-    else if (m[3] !== undefined)
-      nodes.push(
-        <code key={`${keyPrefix}-c${i}`} className="inline-code">
-          {m[3]}
-        </code>
-      );
-    last = re.lastIndex;
-    i++;
-  }
-  if (last < text.length) nodes.push(text.slice(last));
-  return nodes;
-}
-
-function parseTableRow(line: string): string[] | null {
-  const trimmed = line.trim();
-  if (!trimmed.includes("|")) return null;
-  const body = trimmed.replace(/^\|/, "").replace(/\|$/, "");
-  const cells: string[] = [];
-  let cell = "";
-  for (let i = 0; i < body.length; i++) {
-    const char = body[i];
-    if (char === "\\" && body[i + 1] === "|") {
-      cell += "|";
-      i++;
-    } else if (char === "|") {
-      cells.push(cell.trim());
-      cell = "";
-    } else {
-      cell += char;
-    }
-  }
-  cells.push(cell.trim());
-  return cells.length > 1 ? cells : null;
-}
-
-function parseTableAlignments(cells: string[]): Array<"left" | "center" | "right"> | null {
-  if (!cells.every((cell) => /^:?-{3,}:?$/.test(cell))) return null;
-  return cells.map((cell) => {
-    if (cell.startsWith(":") && cell.endsWith(":")) return "center";
-    if (cell.endsWith(":")) return "right";
-    return "left";
-  });
-}
-
-/** 非代码块文本渲染为段落/列表/表格；空行转为段距（不与块级换行叠加） */
-function renderProse(text: string, keyPrefix: string): ReactNode {
-  const lines = text.split("\n");
-  const out: ReactNode[] = [];
-  let list: ReactNode[] = [];
-  let pendingGap = false;
-  let listGap = false;
-  const flushList = () => {
-    if (list.length) {
-      out.push(
-        <ul key={`${keyPrefix}-ul${out.length}`} className={`ai-list${listGap ? " para-gap" : ""}`}>
-          {list}
-        </ul>
-      );
-      list = [];
-      listGap = false;
-    }
-  };
-  for (let idx = 0; idx < lines.length; idx++) {
-    const line = lines[idx];
-    const headers = parseTableRow(line);
-    const divider = idx + 1 < lines.length ? parseTableRow(lines[idx + 1]) : null;
-    const alignments = divider ? parseTableAlignments(divider) : null;
-    if (headers && alignments && headers.length === alignments.length) {
-      flushList();
-      const rows: string[][] = [];
-      idx += 2;
-      while (idx < lines.length) {
-        const row = parseTableRow(lines[idx]);
-        if (!row) break;
-        rows.push(headers.map((_, cellIndex) => row[cellIndex] ?? ""));
-        idx++;
-      }
-      idx--;
-      out.push(
-        <div key={`${keyPrefix}-table${out.length}`} className={`ai-table-wrap${pendingGap ? " para-gap" : ""}`}>
-          <table className="ai-table">
-            <thead>
-              <tr>
-                {headers.map((header, cellIndex) => (
-                  <th key={`${keyPrefix}-th${cellIndex}`} style={{ textAlign: alignments[cellIndex] }}>
-                    {renderInline(header, `${keyPrefix}-th${cellIndex}`)}
-                  </th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {rows.map((row, rowIndex) => (
-                <tr key={`${keyPrefix}-tr${rowIndex}`}>
-                  {row.map((cell, cellIndex) => (
-                    <td key={`${keyPrefix}-td${rowIndex}-${cellIndex}`} style={{ textAlign: alignments[cellIndex] }}>
-                      {renderInline(cell, `${keyPrefix}-td${rowIndex}-${cellIndex}`)}
-                    </td>
-                  ))}
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      );
-      pendingGap = false;
-      continue;
-    }
-    const bullet = line.match(/^\s*[-*]\s+(.*)$/);
-    const numbered = line.match(/^\s*\d+\.\s+(.*)$/);
-    if (bullet || numbered) {
-      if (list.length === 0 && pendingGap) listGap = true;
-      list.push(<li key={`${keyPrefix}-li${idx}`}>{renderInline((bullet ?? numbered)![1], `${keyPrefix}-li${idx}`)}</li>);
-      pendingGap = false;
-    } else if (line.trim() === "") {
-      flushList();
-      pendingGap = true;
-    } else {
-      flushList();
-      out.push(
-        <div key={`${keyPrefix}-p${idx}`} className={`ai-line${pendingGap ? " para-gap" : ""}`}>
-          {renderInline(line, `${keyPrefix}-p${idx}`)}
-        </div>
-      );
-      pendingGap = false;
-    }
-  }
-  flushList();
-  return out;
+function getAiPanelRuntimeKey(key: string): string {
+  return getAgentRuntimeKey("ai-panel", getSurfaceIdFromConversationKey(key));
 }
 
 function toChatMessage(message: UiChatMessage): ChatMessage {
@@ -262,95 +122,44 @@ function formatOutputLabel(chars: number, truncated: boolean): string {
   return `输出 ${chars}${truncated ? "+" : ""} 字符`;
 }
 
-function clipText(text: string, limit: number): { text: string; truncated: boolean } {
-  if (text.length <= limit) return { text, truncated: false };
-  return { text: `${text.slice(0, limit)}\n...[输出已截断]`, truncated: true };
-}
-
-function normalizeAgentCommand(command: string): string {
-  return command.replace(/\s+/g, " ").trim();
-}
-
-type AgentCommandResult = {
-  command: string;
-  note?: string;
-  exitCode: number | null;
-  output: string;
-  outputChars: number;
-  truncated: boolean;
-};
-
-function buildAgentFeedback(goal: string | undefined, results: AgentCommandResult[]): string {
-  const sections = results
-    .map((r, idx) => {
-      const out = r.output || "(无输出)";
-      return `【命令 ${idx + 1}/${results.length}】\n\`\`\`\n${r.command}\n\`\`\`\n${
-        r.note ? `执行说明：${r.note}\n` : ""
-      }退出码 ${r.exitCode ?? "?"}，输出：\n${out}`;
-    })
-    .join("\n\n");
-  return `${goal ? `【原始任务】\n${goal}\n\n` : ""}【Agent 执行批次结果】\n${sections}\n\n请基于以上真实输出继续推进：如果目标尚未达成，给出下一批 1 到 ${AGENT_MAX_COMMANDS_PER_BATCH} 条安全、必要、非重复的命令；如果已经足够判断，以"任务完成"开头给出结论，不要再输出命令代码块。`;
-}
-
-function buildAgentExecDetail(results: AgentCommandResult[]): { output: string; outputChars: number; truncated: boolean } {
-  const raw = results
-    .map((r, idx) => `# ${idx + 1}. ${r.command}\n退出码 ${r.exitCode ?? "?"}\n${r.output || "(无输出)"}`)
-    .join("\n\n");
-  const clipped = clipText(raw, AGENT_EXEC_DETAIL_LIMIT);
-  return {
-    output: clipped.text,
-    outputChars: results.reduce((sum, r) => sum + r.outputChars, 0),
-    truncated: clipped.truncated || results.some((r) => r.truncated),
-  };
-}
-
-function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
-  let timer = 0;
-  const timeout = new Promise<T>((_, reject) => {
-    timer = window.setTimeout(() => reject(new Error(message)), ms);
-  });
-  return Promise.race([promise, timeout]).finally(() => window.clearTimeout(timer));
-}
-
-function prepareAgentCommand(command: string): { command: string; note?: string } {
-  const line = command.trim();
-  if (/^top\b/.test(line) && !/(^|\s)-b(\s|$)/.test(line)) {
-    const rest = line.replace(/^top\b/, "").trim();
-    return {
-      command: `top -b -n 1${rest ? ` ${rest}` : ""}`,
-      note: "已将 top 调整为单次批处理模式，执行后自动退出。",
-    };
-  }
-  if (/^htop\b/.test(line)) {
-    return {
-      command: "top -b -n 1",
-      note: "htop 是交互界面，已用 top 单次批处理模式替代。",
-    };
-  }
-  const needsTimeout =
-    /^(watch|less|more)\b/.test(line) ||
-    /^tail\b[\s\S]*\s-f\b/.test(line) ||
-    /^journalctl\b[\s\S]*\s-f\b/.test(line);
-  if (needsTimeout && !/^timeout\b/.test(line)) {
-    return {
-      command: `timeout 8s ${line}`,
-      note: "已为常驻/翻页命令加 8 秒自动退出。",
-    };
-  }
-  return { command: line };
-}
-
 function AgentExecSummary({ meta }: { meta: AgentExecMeta }) {
   const [expanded, setExpanded] = useState(false);
-  const ok = meta.exitCode === 0;
+  const ok = meta.status === "completed" && meta.exitCode === 0;
   const outputText = meta.output || "(无输出)";
   const outputLabel = formatOutputLabel(meta.outputChars, meta.truncated);
   const commandCount = meta.commandCount ?? 1;
-  const stateLabel = commandCount > 1 ? `已执行 ${commandCount} 条` : "已执行";
+  const stateLabel =
+    meta.status === "running"
+      ? commandCount > 1
+        ? `执行中 ${commandCount} 条`
+        : "执行中"
+      : meta.status === "cancelled"
+        ? commandCount > 1
+          ? `已停止 ${commandCount} 条`
+          : "已停止"
+        : meta.status === "rejected"
+          ? "已拒绝，任务停止"
+        : meta.status === "failed"
+          ? commandCount > 1
+            ? `执行失败 ${commandCount} 条`
+            : "执行失败"
+          : commandCount > 1
+            ? `已执行 ${commandCount} 条`
+            : "已执行";
   const commandTitle = commandCount > 1 ? meta.command.split("\n")[0] : meta.command;
+  const metaLabel =
+    meta.status === "running"
+      ? "等待结果"
+      : meta.status === "cancelled"
+        ? "已中断"
+        : meta.status === "rejected"
+          ? "未执行"
+        : `退出码 ${formatExitCode(meta.exitCode)} · ${outputLabel}`;
 
   return (
-    <div className={`agent-exec ${ok ? "ok" : "warn"}${expanded ? " open" : ""}`}>
+    <div
+      className={`agent-exec ${ok ? "ok" : meta.status}${expanded ? " open" : ""}`}
+    >
       <button
         type="button"
         className="agent-exec-row"
@@ -362,9 +171,7 @@ function AgentExecSummary({ meta }: { meta: AgentExecMeta }) {
           {stateLabel}
         </span>
         <code className="agent-exec-command">{commandTitle}</code>
-        <span className="agent-exec-meta">
-          退出码 {formatExitCode(meta.exitCode)} · {outputLabel}
-        </span>
+        <span className="agent-exec-meta">{metaLabel}</span>
         <span className="agent-exec-action">{expanded ? "收起" : "展开"}</span>
       </button>
       {expanded && (
@@ -373,6 +180,42 @@ function AgentExecSummary({ meta }: { meta: AgentExecMeta }) {
           <pre>{meta.command}</pre>
           <div className="agent-exec-label">输出</div>
           <pre>{outputText}</pre>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function AgentLimitNotice({
+  meta,
+  onContinue,
+  onEnd,
+}: {
+  meta: AgentLimitMeta;
+  onContinue: () => void;
+  onEnd: () => void;
+}) {
+  const paused = meta.status === "paused";
+  return (
+    <div className={`agent-limit-notice ${meta.status}`}>
+      <div>
+        <strong>
+          {paused
+            ? `已连续执行 ${meta.rounds} 轮，任务尚未完成`
+            : meta.status === "continued"
+              ? `已确认继续，执行预算增加 ${AGENT_AUTO_STEP_CHUNK} 轮`
+              : "任务已由用户结束"}
+        </strong>
+        {paused && <span>为避免 Agent 无限制执行，需要你确认后继续。</span>}
+      </div>
+      {paused && (
+        <div className="agent-limit-actions">
+          <button className="btn mini primary" onClick={onContinue}>
+            继续 {AGENT_AUTO_STEP_CHUNK} 轮
+          </button>
+          <button className="btn mini" onClick={onEnd}>
+            结束任务
+          </button>
         </div>
       )}
     </div>
@@ -400,7 +243,10 @@ export default function AiPanel({
   const [includeContext, setIncludeContext] = useState(true);
   const [agentModes, setAgentModes] = useState<Record<string, boolean>>({});
   const agentModesRef = useRef<Record<string, boolean>>({});
-  const agentMode = Boolean(activeSessionId && agentModes[conversationKey]);
+  const agentMode = isAiPanelAgentModeEnabled(
+    activeSessionId,
+    agentModes[conversationKey]
+  );
   const activeConversationKey = getScopedConversationKey(conversationKey, agentMode);
   const messages = convos[activeConversationKey] ?? [];
   const [drafts, setDrafts] = useState<Record<string, string>>({});
@@ -412,16 +258,23 @@ export default function AiPanel({
   const streaming = streamingKeys.has(activeConversationKey);
   const agentBusy = agentBusyKeys.has(activeConversationKey);
   const scrollRef = useRef<HTMLDivElement>(null);
-  const abortedKeys = useRef<Set<string>>(new Set());
+  const requestGate = useRef(new ScopedRequestGate());
+  const aiRequestControllers = useRef<Record<string, AbortController>>({});
+  const streamingAssistantIds = useRef<Record<string, string>>({});
+  const activeExecMessageIds = useRef<Record<string, string>>({});
   const activeSessionIdRef = useRef<string | undefined>(activeSessionId);
-  // 每个会话一条常驻 Agent 通道
-  const agentIds = useRef<Record<string, string>>({});
   const agentAutoSteps = useRef<Record<string, number>>({});
+  const agentStepLimits = useRef<Record<string, number>>({});
   const agentGoals = useRef<Record<string, string>>({});
   const agentExecutedCommands = useRef<Record<string, Set<string>>>({});
+  const [agentLimitPauses, setAgentLimitPauses] = useState<Record<string, AgentLimitPause>>({});
+  const agentLimitPausesRef = useRef<Record<string, AgentLimitPause>>({});
+  const pendingAgentInstructions = useRef<Record<string, string[]>>({});
   const agentRunSeq = useRef<Record<string, number>>({});
   const conversationEnvs = useRef<Record<string, string>>({});
   const handledCloseNonce = useRef<number | null>(null);
+  const agentLimitPaused = Boolean(agentLimitPauses[activeConversationKey]);
+  const agentCanQueue = agentMode && (streaming || agentBusy || agentLimitPaused);
 
   const setMessagesFor = (key: string, updater: (prev: UiChatMessage[]) => UiChatMessage[]) =>
     setConvos((prev) => {
@@ -458,6 +311,44 @@ export default function AiPanel({
     return next;
   };
 
+  const setAgentLimitPauseFor = (key: string, pause: AgentLimitPause | null) => {
+    const next = { ...agentLimitPausesRef.current };
+    if (pause) next[key] = pause;
+    else delete next[key];
+    agentLimitPausesRef.current = next;
+    setAgentLimitPauses(next);
+  };
+
+  const updateAgentLimitMessage = (key: string, status: AgentLimitMeta["status"]) => {
+    setMessagesFor(key, (prev) =>
+      prev.map((message) =>
+        message.meta?.kind === "agent-limit" && message.meta.status === "paused"
+          ? { ...message, meta: { ...message.meta, status } }
+          : message
+      )
+    );
+  };
+
+  const updateQueuedAgentMessages = (key: string, status: AgentQueuedMeta["status"]) => {
+    setMessagesFor(key, (prev) =>
+      prev.map((message) =>
+        message.meta?.kind === "agent-queued" && message.meta.status === "queued"
+          ? { ...message, meta: { ...message.meta, status } }
+          : message
+      )
+    );
+  };
+
+  const clearPendingAgentInstructions = (
+    key: string,
+    status: AgentQueuedMeta["status"] = "cancelled"
+  ) => {
+    if (pendingAgentInstructions.current[key]?.length) {
+      updateQueuedAgentMessages(key, status);
+    }
+    delete pendingAgentInstructions.current[key];
+  };
+
   useEffect(() => {
     convosRef.current = convos;
   }, [convos]);
@@ -467,20 +358,42 @@ export default function AiPanel({
   }, [activeSessionId]);
 
   const closeAgentChannel = (key: string) => {
-    const aid = agentIds.current[key];
-    if (aid) {
-      api.agentClose(aid).catch(() => {});
-      delete agentIds.current[key];
-    }
+    void agentChannels.close(getAiPanelRuntimeKey(key));
   };
 
+  useEffect(
+    () => () => {
+      const keys = new Set([
+        ...Object.keys(convosRef.current),
+        ...Object.keys(aiRequestControllers.current),
+        ...Object.keys(agentRunSeq.current),
+      ]);
+      keys.forEach((key) => {
+        requestGate.current.invalidate(key);
+        aiRequestControllers.current[key]?.abort();
+        if (key.startsWith("agent:")) closeAgentChannel(key);
+      });
+    },
+    []
+  );
+
   const resetAgentChannel = (key: string) => {
-    abortedKeys.current.add(key);
+    requestGate.current.invalidate(key);
+    aiRequestControllers.current[key]?.abort();
+    delete aiRequestControllers.current[key];
     bumpAgentRunSeq(key);
     closeAgentChannel(key);
+    delete streamingAssistantIds.current[key];
+    delete activeExecMessageIds.current[key];
     agentAutoSteps.current[key] = 0;
+    delete agentStepLimits.current[key];
     delete agentGoals.current[key];
     delete agentExecutedCommands.current[key];
+    clearPendingAgentInstructions(key);
+    if (agentLimitPausesRef.current[key]) {
+      updateAgentLimitMessage(key, "ended");
+    }
+    setAgentLimitPauseFor(key, null);
     setAgentBusyFor(key, false);
     setStreamingFor(key, false);
   };
@@ -494,12 +407,18 @@ export default function AiPanel({
     );
     if (keySet.size === 0) return;
     keySet.forEach((key) => {
-      abortedKeys.current.add(key);
+      requestGate.current.invalidate(key);
+      aiRequestControllers.current[key]?.abort();
+      delete aiRequestControllers.current[key];
       bumpAgentRunSeq(key);
       setAgentBusyFor(key, false);
       setStreamingFor(key, false);
       closeAgentChannel(key);
     });
+    const nextLimitPauses = { ...agentLimitPausesRef.current };
+    keySet.forEach((key) => delete nextLimitPauses[key]);
+    agentLimitPausesRef.current = nextLimitPauses;
+    setAgentLimitPauses(nextLimitPauses);
     setConvos((prev) => {
       let changed = false;
       const next = { ...prev };
@@ -510,7 +429,11 @@ export default function AiPanel({
         }
         delete agentGoals.current[key];
         delete agentAutoSteps.current[key];
+        delete agentStepLimits.current[key];
         delete agentExecutedCommands.current[key];
+        delete pendingAgentInstructions.current[key];
+        delete streamingAssistantIds.current[key];
+        delete activeExecMessageIds.current[key];
         delete conversationEnvs.current[key];
       });
       if (changed) convosRef.current = next;
@@ -535,39 +458,89 @@ export default function AiPanel({
     disposeConversationKeys(closeAgentRequest.keys);
   }, [closeAgentRequest]);
 
-  useEffect(
-    () => () => {
-      Object.keys(agentIds.current).forEach(closeAgentChannel);
-    },
-    []
-  );
-
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
   }, [messages]);
 
   const stop = () => {
     const key = activeConversationKey;
-    abortedKeys.current.add(key);
+    requestGate.current.invalidate(key);
+    aiRequestControllers.current[key]?.abort();
+    delete aiRequestControllers.current[key];
     bumpAgentRunSeq(key);
-    closeAgentChannel(key);
+    void agentChannels.interrupt(getAiPanelRuntimeKey(key));
+    const assistantMessageId = streamingAssistantIds.current[key];
+    const execMessageId = activeExecMessageIds.current[key];
+    setMessagesFor(key, (prev) => {
+      let stopNoticeApplied = false;
+      const next = prev.map((message) => {
+        if (message.id === execMessageId && message.meta?.kind === "agent-exec") {
+          stopNoticeApplied = true;
+          const output = "Agent 命令已由用户停止。";
+          return {
+            ...message,
+            content: output,
+            meta: {
+              ...message.meta,
+              status: "cancelled" as const,
+              exitCode: null,
+              output,
+              outputChars: output.length,
+              truncated: false,
+            },
+          };
+        }
+        if (message.id === assistantMessageId) {
+          stopNoticeApplied = true;
+          return {
+            ...message,
+            content: message.content.trim()
+              ? `${message.content.trim()}\n\n已停止。`
+              : "已停止。",
+          };
+        }
+        return message;
+      });
+      if (!stopNoticeApplied) {
+        next.push({
+          id: crypto.randomUUID(),
+          role: "assistant",
+          content: "已停止。",
+        });
+      }
+      return next;
+    });
+    delete streamingAssistantIds.current[key];
+    delete activeExecMessageIds.current[key];
+    clearPendingAgentInstructions(key);
+    setAgentLimitPauseFor(key, null);
     setAgentBusyFor(key, false);
     setStreamingFor(key, false);
   };
 
   const send = async (userText: string, meta?: AgentExecMeta, options?: SendOptions) => {
     const sessionId = options?.sessionId ?? activeSessionId ?? activeSessionIdRef.current;
-    const useAgent = options?.useAgent ?? Boolean(sessionId && agentModesRef.current[conversationKey]);
+    const useAgent =
+      options?.useAgent ??
+      isAiPanelAgentModeEnabled(
+        sessionId,
+        agentModesRef.current[conversationKey]
+      );
     const key = options?.key ?? getScopedConversationKey(conversationKey, useAgent);
+    const appendUserMessage = options?.appendUserMessage ?? true;
+    const resetAgentTask = options?.resetAgentTask ?? (useAgent && !meta && appendUserMessage);
     if (
       !userText.trim() ||
       streamingKeysRef.current.has(key) ||
       agentBusyKeysRef.current.has(key)
     ) return;
-    if (useAgent && !meta) {
+    if (resetAgentTask) {
       agentAutoSteps.current[key] = 0;
+      agentStepLimits.current[key] = AGENT_AUTO_STEP_CHUNK;
       agentGoals.current[key] = userText.trim();
       agentExecutedCommands.current[key] = new Set();
+      clearPendingAgentInstructions(key);
+      setAgentLimitPauseFor(key, null);
     }
     let question = userText.trim();
     // Agent 模式不附带终端上下文（Agent 有自己的执行通道）
@@ -578,64 +551,225 @@ export default function AiPanel({
       }
     }
     const history: ChatMessage[] = [
-      ...(convosRef.current[key] ?? []).map(toChatMessage),
+      ...(convosRef.current[key] ?? [])
+        .filter(
+          (message) =>
+            message.meta?.kind !== "agent-limit" &&
+            message.meta?.kind !== "agent-queued"
+        )
+        .map(toChatMessage),
       { role: "user", content: question },
     ];
+    const assistantMessageId = crypto.randomUUID();
+    streamingAssistantIds.current[key] = assistantMessageId;
     setMessagesFor(key, (prev) => [
       ...prev,
-      { role: "user", content: userText.trim(), meta },
-      { role: "assistant", content: "" },
+      ...(appendUserMessage
+        ? [{ id: crypto.randomUUID(), role: "user" as const, content: userText.trim(), meta }]
+        : []),
+      { id: assistantMessageId, role: "assistant", content: "" },
     ]);
-    if (!meta) setDrafts((prev) => ({ ...prev, [key]: "" }));
-    abortedKeys.current.delete(key);
+    if (appendUserMessage && !meta) setDrafts((prev) => ({ ...prev, [key]: "" }));
+    const requestToken = requestGate.current.begin(key);
     setStreamingFor(key, true);
 
     // 环境信息注入 system prompt；Agent 模式用 Agent 提示词
     const env = options?.env ?? (meta ? conversationEnvs.current[key] ?? "" : getEnv().trim());
     conversationEnvs.current[key] = env;
-    const base = useAgent ? AGENT_SYSTEM_PROMPT : SYSTEM_PROMPT;
+    const base = useAgent ? AGENT_SYSTEM_PROMPT : ASSISTANT_SYSTEM_PROMPT;
     const sys = env ? `${base}\n\n【当前服务器环境】\n${env}` : base;
     let assistantText = "";
+    const requestController = new AbortController();
+    aiRequestControllers.current[key] = requestController;
 
-    const appendToLast = (extra: string) =>
+    const replaceAssistantMessage = (content: string) =>
       setMessagesFor(key, (prev) => {
         const next = [...prev];
-        if (next.length) next[next.length - 1] = { role: "assistant", content: next[next.length - 1].content + extra };
+        const index = next.findIndex((message) => message.id === assistantMessageId);
+        if (index >= 0) next[index] = { ...next[index], content };
         return next;
       });
 
     try {
       await api.aiChat(sys, history, (e) => {
-        if (abortedKeys.current.has(key)) return;
+        if (!requestGate.current.isCurrent(requestToken)) return;
         if (e.type === "delta") {
           assistantText += e.text;
-          appendToLast(e.text);
+          replaceAssistantMessage(
+            useAgent
+              ? stripTypedActionEnvelopeForDisplay(assistantText, true)
+              : assistantText
+          );
         }
         else if (e.type === "error") {
-          appendToLast(`\n[错误] ${e.message}`);
+          replaceAssistantMessage(
+            `${stripTypedActionEnvelopeForDisplay(assistantText, true)}\n[错误] ${
+              e.message
+            }`.trim()
+          );
+          delete streamingAssistantIds.current[key];
           setStreamingFor(key, false);
-        } else if (e.type === "done") {
-          setStreamingFor(key, false);
-          const commands = useAgent ? extractAgentCommands(assistantText) : [];
-          if (commands.length > 0 && sessionId) {
+          if (useAgent && sessionId && pendingAgentInstructions.current[key]?.length) {
             window.setTimeout(() => {
-              void runAgentBatch(commands, { key, sessionId, auto: true });
+              void processPendingAgentInstructions(key, sessionId);
+            }, 0);
+          }
+        } else if (e.type === "done") {
+          delete streamingAssistantIds.current[key];
+          setStreamingFor(key, false);
+          if (useAgent && sessionId && pendingAgentInstructions.current[key]?.length) {
+            window.setTimeout(() => {
+              void processPendingAgentInstructions(key, sessionId);
+            }, 0);
+            return;
+          }
+          const surfaceId = getSurfaceIdFromConversationKey(key);
+          const plan =
+            useAgent && sessionId
+              ? parseAgentActionPlan(assistantText, {
+                  surfaceId,
+                  sessionId,
+                  timeoutMs: AGENT_RUN_TIMEOUT_MS,
+                  maxActions: AGENT_MAX_COMMANDS_PER_BATCH,
+                })
+              : null;
+          const actions =
+            plan?.actions.filter(
+              (action): action is ShellExecuteAction =>
+                action.type === "shell.execute"
+            ) ?? [];
+          if (plan) {
+            const unsupportedActions =
+              plan.actions.length - actions.length;
+            const planNotice = [
+              plan.displayText,
+              plan.errors.length > 0 && actions.length > 0
+                ? `动作计划已按安全上限处理：${plan.errors.join("；")}`
+                : "",
+              unsupportedActions > 0
+                ? `右侧 AI 模式暂不执行 ${unsupportedActions} 个非 Shell 动作。`
+                : "",
+              plan.source === "typed" &&
+              actions.length === 0 &&
+              plan.errors.length > 0
+                ? `动作计划无效，本轮未执行：${plan.errors.join("；")}`
+                : "",
+            ]
+              .filter(Boolean)
+              .join("\n\n");
+            replaceAssistantMessage(planNotice);
+          }
+          if (actions.length > 0 && sessionId) {
+            const scheduledRunSeq = agentRunSeq.current[key] ?? 0;
+            window.setTimeout(() => {
+              if (
+                !requestGate.current.isCurrent(requestToken) ||
+                scheduledRunSeq !== (agentRunSeq.current[key] ?? 0)
+              ) {
+                return;
+              }
+              void runAgentBatch(actions, {
+                key,
+                surfaceId,
+                sessionId,
+                auto: true,
+              });
             }, 0);
           }
         }
-      });
+      }, requestController.signal);
     } catch (err) {
-      if (abortedKeys.current.has(key)) return;
-      appendToLast(`\n[错误] ${String(err)}`);
+      if (!requestGate.current.isCurrent(requestToken)) return;
+      replaceAssistantMessage(
+        `${stripTypedActionEnvelopeForDisplay(assistantText, true)}\n[错误] ${String(
+          err
+        )}`.trim()
+      );
+      delete streamingAssistantIds.current[key];
       setStreamingFor(key, false);
+      if (useAgent && sessionId && pendingAgentInstructions.current[key]?.length) {
+        window.setTimeout(() => {
+          void processPendingAgentInstructions(key, sessionId);
+        }, 0);
+      }
+    } finally {
+      if (aiRequestControllers.current[key] === requestController) {
+        delete aiRequestControllers.current[key];
+      }
     }
   };
+
+  function queueAgentInstruction(key: string, text: string) {
+    const instruction = text.trim();
+    if (!instruction) return;
+    pendingAgentInstructions.current[key] = [
+      ...(pendingAgentInstructions.current[key] ?? []),
+      instruction,
+    ];
+    setMessagesFor(key, (prev) => [
+      ...prev,
+      {
+        id: crypto.randomUUID(),
+        role: "user",
+        content: instruction,
+        meta: { kind: "agent-queued", status: "queued" },
+      },
+    ]);
+    setDrafts((prev) => ({ ...prev, [key]: "" }));
+  }
+
+  async function processPendingAgentInstructions(
+    key: string,
+    sessionId: string,
+    executionFeedback?: string
+  ): Promise<boolean> {
+    const instructions = pendingAgentInstructions.current[key];
+    if (!instructions?.length) return false;
+    delete pendingAgentInstructions.current[key];
+    updateQueuedAgentMessages(key, "applied");
+    const addition = instructions
+      .map((instruction, index) => `${index + 1}. ${instruction}`)
+      .join("\n");
+    const currentGoal = agentGoals.current[key]?.trim();
+    agentGoals.current[key] = currentGoal
+      ? `${currentGoal}\n\n【用户追加要求】\n${addition}`
+      : addition;
+    const prompt = `${executionFeedback ? `${executionFeedback}\n\n` : ""}【用户执行中追加要求】\n${addition}\n\n请立即结合追加要求重新规划。此前尚未执行的命令计划已经失效，不要直接沿用；先判断目标是否变化，再给出下一批必要命令或最终结论。`;
+    await send(prompt, undefined, {
+      key,
+      sessionId,
+      useAgent: true,
+      env: conversationEnvs.current[key] ?? "",
+      appendUserMessage: false,
+      resetAgentTask: false,
+    });
+    return true;
+  }
 
   const lastNonce = useRef(0);
   useEffect(() => {
     if (externalRequest && externalRequest.nonce !== lastNonce.current && hasProvider) {
       lastNonce.current = externalRequest.nonce;
-      send(externalRequest.text);
+      const useAgent = Boolean(externalRequest.useAgent && activeSessionId);
+      if (useAgent) {
+        setAgentModeFor(conversationKey, true);
+        const key = getScopedConversationKey(conversationKey, true);
+        if (
+          streamingKeysRef.current.has(key) ||
+          agentBusyKeysRef.current.has(key) ||
+          agentLimitPausesRef.current[key]
+        ) {
+          queueAgentInstruction(key, externalRequest.text);
+        } else {
+          void send(externalRequest.text, undefined, {
+            key,
+            sessionId: activeSessionId,
+            useAgent: true,
+          });
+        }
+      } else {
+        void send(externalRequest.text, undefined, { useAgent: false });
+      }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [externalRequest]);
@@ -659,13 +793,44 @@ export default function AiPanel({
     });
   };
 
+  const continueAgentAfterLimit = (key: string) => {
+    const pause = agentLimitPausesRef.current[key];
+    if (!pause) return;
+    agentStepLimits.current[key] =
+      (agentStepLimits.current[key] ?? AGENT_AUTO_STEP_CHUNK) + AGENT_AUTO_STEP_CHUNK;
+    setAgentLimitPauseFor(key, null);
+    updateAgentLimitMessage(key, "continued");
+    if (pendingAgentInstructions.current[key]?.length) {
+      void processPendingAgentInstructions(key, pause.sessionId);
+      return;
+    }
+    void runAgentBatch(pause.actions, {
+      key,
+      surfaceId: pause.surfaceId,
+      sessionId: pause.sessionId,
+      auto: true,
+    });
+  };
+
+  const endAgentAtLimit = (key: string) => {
+    if (!agentLimitPausesRef.current[key]) return;
+    updateAgentLimitMessage(key, "ended");
+    resetAgentChannel(key);
+  };
+
+  const submitInput = () => {
+    if (agentCanQueue) {
+      queueAgentInstruction(activeConversationKey, input);
+      return;
+    }
+    void send(input);
+  };
+
   /** Agent 模式：执行 AI 给出的一批命令，把结果汇总喂回 AI 决定下一步 */
-  const runAgentBatch = async (commandInput: string[] | string, options?: AgentStepOptions) => {
-    const commands = (Array.isArray(commandInput) ? commandInput : [commandInput])
-      .map((c) => c.trim())
-      .filter(Boolean)
-      .slice(0, AGENT_MAX_COMMANDS_PER_BATCH);
-    if (commands.length === 0) return;
+  const runAgentBatch = async (
+    commandInput: ShellExecuteAction[] | string[] | string,
+    options?: AgentStepOptions
+  ) => {
     const key = options?.key ?? getScopedConversationKey(conversationKey, true);
     if (streamingKeysRef.current.has(key) || agentBusyKeysRef.current.has(key)) return;
     const sessionId = options?.sessionId ?? activeSessionId ?? activeSessionIdRef.current;
@@ -676,39 +841,104 @@ export default function AiPanel({
       ]);
       return;
     }
+    const surfaceId = options?.surfaceId ?? getSurfaceIdFromConversationKey(key);
+    const inputs = Array.isArray(commandInput) ? commandInput : [commandInput];
+    const actions: ShellExecuteAction[] = inputs
+      .map((item, index) =>
+        typeof item === "string"
+          ? {
+              type: "shell.execute" as const,
+              actionId: `manual-shell-${index + 1}`,
+              surfaceId,
+              sessionId,
+              command: item.trim(),
+              timeoutMs: AGENT_RUN_TIMEOUT_MS,
+            }
+          : item
+      )
+      .filter((action) => action.command.trim())
+      .slice(0, AGENT_MAX_COMMANDS_PER_BATCH);
+    if (actions.length === 0) return;
+    let nextAutoStep: number | undefined;
     if (options?.auto) {
-      const steps = (agentAutoSteps.current[key] ?? 0) + 1;
-      agentAutoSteps.current[key] = steps;
-      if (steps > AGENT_MAX_AUTO_STEPS) {
-        setMessagesFor(key, (prev) => [
-          ...prev,
-          { role: "assistant", content: `[Agent] 已连续执行 ${AGENT_MAX_AUTO_STEPS} 轮，为避免误操作已暂停。需要继续请重新发送任务或关闭后再开启 Agent。` },
-        ]);
+      const nextStep = (agentAutoSteps.current[key] ?? 0) + 1;
+      const stepLimit = agentStepLimits.current[key] ?? AGENT_AUTO_STEP_CHUNK;
+      if (nextStep > stepLimit) {
+        if (!agentLimitPausesRef.current[key]) {
+          setAgentLimitPauseFor(key, { actions, sessionId, surfaceId });
+          setMessagesFor(key, (prev) => [
+            ...prev,
+            {
+              role: "assistant",
+              content: `已连续执行 ${stepLimit} 轮，任务尚未完成。`,
+              meta: { kind: "agent-limit", rounds: stepLimit, status: "paused" },
+            },
+          ]);
+        }
         return;
       }
+      nextAutoStep = nextStep;
     }
     const runSeq = bumpAgentRunSeq(key);
+    const execMessageId = crypto.randomUUID();
+    activeExecMessageIds.current[key] = execMessageId;
+    const commandList = actions.map((action) => action.command).join("\n");
+    setMessagesFor(key, (prev) => [
+      ...prev,
+      {
+        id: execMessageId,
+        role: "user",
+        content: "",
+        meta: {
+          kind: "agent-exec",
+          status: "running",
+          command: commandList,
+          commandCount: actions.length,
+          exitCode: null,
+          output: "",
+          outputChars: 0,
+          truncated: false,
+        },
+      },
+    ]);
     setAgentBusyFor(key, true);
     try {
-      let aid = agentIds.current[key];
-      if (!aid) {
-        aid = await withTimeout(
-          api.agentOpen(sessionId),
-          AGENT_RUN_TIMEOUT_MS,
-          "Agent 连接超时，已取消本次执行。"
+      if (pendingAgentInstructions.current[key]?.length) {
+        setAgentBusyFor(key, false);
+        delete activeExecMessageIds.current[key];
+        setMessagesFor(key, (prev) =>
+          prev.filter((message) => message.id !== execMessageId)
         );
-        if (runSeq !== agentRunSeq.current[key]) {
-          api.agentClose(aid).catch(() => {});
-          return;
-        }
-        agentIds.current[key] = aid;
+        await processPendingAgentInstructions(key, sessionId);
+        return;
+      }
+      if (nextAutoStep !== undefined) {
+        agentAutoSteps.current[key] = nextAutoStep;
       }
       const results: AgentCommandResult[] = [];
+      let rejected = false;
       const executedCommands = agentExecutedCommands.current[key] ?? new Set<string>();
       agentExecutedCommands.current[key] = executedCommands;
-      for (const rawCommand of commands) {
-        const prepared = prepareAgentCommand(rawCommand);
+      const shouldReplan = () => Boolean(pendingAgentInstructions.current[key]?.length);
+      const markReplanBoundary = () => {
+        const lastResult = results[results.length - 1];
+        if (!lastResult) return;
+        lastResult.note = [
+          lastResult.note,
+          "收到用户追加要求，本批次后续命令未执行。",
+        ]
+          .filter(Boolean)
+          .join(" ");
+      };
+      for (const action of actions) {
+        const prepared = prepareAgentCommand(action.command);
         const commandToRun = prepared.command;
+        const actionToRun: ShellExecuteAction = {
+          ...action,
+          surfaceId,
+          sessionId,
+          command: commandToRun,
+        };
         const signature = normalizeAgentCommand(commandToRun);
         if (executedCommands.has(signature)) {
           results.push({
@@ -719,39 +949,78 @@ export default function AiPanel({
             outputChars: 0,
             truncated: false,
           });
-          continue;
-        }
-        const verdict = checkDangerous(commandToRun);
-        if (verdict.danger) {
-          const ok = await confirm({
-            title: "⚠ Agent 危险命令确认",
-            message: `Agent 准备执行：\n\n${commandToRun}\n\n风险：${verdict.reason}\n\n确认让它执行吗？`,
-            danger: true,
-            okText: "确认执行",
-          });
-          if (!ok) {
-            results.push({
-              command: commandToRun,
-              note: "用户取消了危险命令，本批次后续命令未执行。",
-              exitCode: null,
-              output: "已取消执行。",
-              outputChars: 0,
-              truncated: false,
-            });
+          if (shouldReplan()) {
+            markReplanBoundary();
             break;
           }
+          continue;
         }
         try {
-          const result = await withTimeout(
-            api.agentRun(aid, commandToRun),
-            AGENT_RUN_TIMEOUT_MS,
-            "Agent 执行超时，已重置执行通道。请确认命令会自动结束后再重试。"
-          );
+          const runtimeKey = getAiPanelRuntimeKey(key);
+          let outcome = await agentChannels.execute(actionToRun, { runtimeKey });
+          if (outcome.status === "approval-required") {
+            const ok = await confirm({
+              title: "Agent 高风险命令确认",
+              message: `Agent 准备执行：\n\n${commandToRun}\n\n风险：${outcome.risk.reason}\n\n确认让它执行吗？`,
+              danger: true,
+              okText: "确认执行",
+            });
+            if (!ok) {
+              rejected = true;
+              results.push({
+                command: commandToRun,
+                note: "用户取消了高风险命令，本批次后续命令未执行。",
+                exitCode: null,
+                output: "已取消执行。",
+                outputChars: 0,
+                truncated: false,
+              });
+              break;
+            }
+            outcome = await agentChannels.execute(actionToRun, {
+              approved: true,
+              runtimeKey,
+            });
+          }
+          if (outcome.status === "cancelled") {
+            if (runSeq === agentRunSeq.current[key]) {
+              const output = "Agent 命令已停止。";
+              setAgentBusyFor(key, false);
+              delete activeExecMessageIds.current[key];
+              setMessagesFor(key, (prev) =>
+                prev.map((message) =>
+                  message.id === execMessageId &&
+                  message.meta?.kind === "agent-exec"
+                    ? {
+                        ...message,
+                        content: output,
+                        meta: {
+                          ...message.meta,
+                          status: "cancelled" as const,
+                          exitCode: null,
+                          output,
+                          outputChars: output.length,
+                          truncated: false,
+                        },
+                      }
+                    : message
+                )
+              );
+            }
+            return;
+          }
+          if (outcome.status !== "completed") {
+            throw new Error("Agent 动作未完成");
+          }
           if (runSeq !== agentRunSeq.current[key]) {
             return;
           }
+          const result = outcome.result;
           const rawOutput = result.output;
-          const clipped = clipText(rawOutput || "(无输出)", AGENT_OUTPUT_PER_COMMAND_LIMIT);
+          const clipped = clipAgentText(
+            rawOutput || "(无输出)",
+            AGENT_OUTPUT_PER_COMMAND_LIMIT
+          );
           executedCommands.add(signature);
           results.push({
             command: commandToRun,
@@ -761,6 +1030,10 @@ export default function AiPanel({
             outputChars: rawOutput.length,
             truncated: clipped.truncated,
           });
+          if (shouldReplan()) {
+            markReplanBoundary();
+            break;
+          }
         } catch (err) {
           executedCommands.add(signature);
           closeAgentChannel(key);
@@ -775,34 +1048,72 @@ export default function AiPanel({
           break;
         }
       }
-      const feedback = buildAgentFeedback(agentGoals.current[key], results);
+      const disposition = getAgentBatchDisposition(results, rejected);
+      const feedback = rejected
+        ? "用户拒绝了高风险命令，当前 Agent 任务已停止。"
+        : buildAgentFeedback(agentGoals.current[key], results);
       const detail = buildAgentExecDetail(results);
-      const firstProblem = results.find((r) => r.exitCode !== 0);
-      const worstExitCode = firstProblem ? firstProblem.exitCode : 0;
       if (runSeq !== agentRunSeq.current[key]) return;
       setAgentBusyFor(key, false);
-      await send(feedback, {
+      const execMeta: AgentExecMeta = {
         kind: "agent-exec",
+        status: disposition.status,
         command: results.map((r) => r.command).join("\n"),
         commandCount: results.length,
-        exitCode: worstExitCode,
+        exitCode: disposition.exitCode,
         output: detail.output,
         outputChars: detail.outputChars,
         truncated: detail.truncated,
-      }, {
+      };
+      setMessagesFor(key, (prev) =>
+        prev.map((message) =>
+          message.id === execMessageId
+            ? { ...message, content: feedback, meta: execMeta }
+            : message
+        )
+      );
+      delete activeExecMessageIds.current[key];
+      if (!disposition.shouldContinue) {
+        clearPendingAgentInstructions(key);
+        return;
+      }
+      if (pendingAgentInstructions.current[key]?.length) {
+        await processPendingAgentInstructions(key, sessionId);
+        return;
+      }
+      await send(feedback, execMeta, {
         key,
         sessionId,
         useAgent: true,
         env: conversationEnvs.current[key] ?? "",
+        appendUserMessage: false,
       }); // 结果喂回 AI，产生下一步
     } catch (e) {
       if (runSeq !== agentRunSeq.current[key]) return;
       closeAgentChannel(key);
       setAgentBusyFor(key, false);
-      setMessagesFor(key, (prev) => [
-        ...prev,
-        { role: "assistant", content: `[Agent 执行失败] ${String(e)}` },
-      ]);
+      const output = String(e);
+      setMessagesFor(key, (prev) => {
+        const next = prev.map((message) =>
+          message.id === execMessageId && message.meta?.kind === "agent-exec"
+            ? {
+                ...message,
+                content: output,
+                meta: {
+                  ...message.meta,
+                  status: "failed" as const,
+                  exitCode: null,
+                  output,
+                  outputChars: output.length,
+                  truncated: false,
+                },
+              }
+            : message
+        );
+        next.push({ role: "assistant", content: `[Agent 执行失败] ${output}` });
+        return next;
+      });
+      delete activeExecMessageIds.current[key];
     }
   };
 
@@ -867,40 +1178,48 @@ export default function AiPanel({
         )}
         {messages.map((m, i) => {
           const agentMeta = m.meta?.kind === "agent-exec" ? m.meta : null;
+          const limitMeta = m.meta?.kind === "agent-limit" ? m.meta : null;
+          const queuedMeta = m.meta?.kind === "agent-queued" ? m.meta : null;
           return (
             <div
               key={i}
               className={`ai-msg ${m.role}${m.role === "assistant" ? " structured" : ""}${
-                agentMeta ? " agent-exec-msg" : ""
-              }`}
+                agentMeta || limitMeta ? " agent-exec-msg" : ""
+              }${queuedMeta ? " agent-queued-msg" : ""}`}
             >
               {agentMeta ? (
                 <AgentExecSummary meta={agentMeta} />
+              ) : limitMeta ? (
+                <AgentLimitNotice
+                  meta={limitMeta}
+                  onContinue={() => continueAgentAfterLimit(activeConversationKey)}
+                  onEnd={() => endAgentAtLimit(activeConversationKey)}
+                />
               ) : m.role === "user" ? (
-                m.content
-              ) : (
-                splitBlocks(m.content).map((b, j) =>
-                  b.code ? (
-                      <div key={j} className={`code-block${agentMode ? " agent-code" : ""}`}>
-                        <pre>{b.content}</pre>
-                        {!agentMode && (
-                          <button
-                            className="btn mini"
-                            onClick={() => insertCommand(b.content)}
-                            title="插入到当前终端（需自行按回车执行）"
-                          >
-                            插入
-                          </button>
-                        )}
-                      </div>
-                    ) : (
-                      <div key={j} className="ai-prose">
-                        {renderProse(b.content, `${i}-${j}`)}
-                      </div>
-                    )
+                queuedMeta ? (
+                  <>
+                    <div>{m.content}</div>
+                    <span className={`agent-queued-status ${queuedMeta.status}`}>
+                      {queuedMeta.status === "queued"
+                        ? "等待当前步骤结束后处理"
+                        : queuedMeta.status === "applied"
+                          ? "已纳入后续计划"
+                          : "已取消"}
+                    </span>
+                  </>
+                ) : (
+                  m.content
                 )
+              ) : (
+                <AgentMarkdown
+                  content={m.content}
+                  codeClassName={agentMode ? "agent-code" : undefined}
+                  onInsertCommand={agentMode ? undefined : insertCommand}
+                />
               )}
-              {m.role === "assistant" && streaming && i === messages.length - 1 && (
+              {m.role === "assistant" &&
+                streaming &&
+                m.id === streamingAssistantIds.current[activeConversationKey] && (
                 <span className="cursor-blink">▌</span>
               )}
             </div>
@@ -919,27 +1238,44 @@ export default function AiPanel({
         <textarea
           className="ai-input"
           rows={2}
-          placeholder="描述任务或提问，例如：查看占用 8080 端口的进程"
+          placeholder={
+            agentCanQueue
+              ? "追加要求，将在当前步骤结束后处理"
+              : "描述任务或提问，例如：查看占用 8080 端口的进程"
+          }
           value={input}
-          disabled={streaming || agentBusy}
+          disabled={!agentMode && (streaming || agentBusy)}
           onChange={(e) =>
             setDrafts((prev) => ({ ...prev, [activeConversationKey]: e.target.value }))
           }
           onKeyDown={(e) => {
             if (e.key === "Enter" && !e.shiftKey) {
               e.preventDefault();
-              send(input);
+              submitInput();
             }
           }}
         />
         <div className="ai-input-bar">
-          <span className="ai-input-hint">Enter 发送 · Shift+Enter 换行</span>
-          {streaming ? (
+          <span className="ai-input-hint">
+            {agentCanQueue ? "Enter 追加 · Shift+Enter 换行" : "Enter 发送 · Shift+Enter 换行"}
+          </span>
+          {agentCanQueue ? (
+            <div className="agent-input-actions">
+              {(streaming || agentBusy) && (
+                <button className="btn stop-btn" onClick={stop} title="停止当前 Agent 任务">
+                  ■ 停止
+                </button>
+              )}
+              <button className="btn primary send-btn" onClick={submitInput} disabled={!input.trim()}>
+                追加 ➤
+              </button>
+            </div>
+          ) : streaming ? (
             <button className="btn stop-btn" onClick={stop} title="停止生成">
               ■ 停止
             </button>
           ) : (
-            <button className="btn primary send-btn" onClick={() => send(input)} disabled={!input.trim() || agentBusy}>
+            <button className="btn primary send-btn" onClick={submitInput} disabled={!input.trim() || agentBusy}>
               发送 ➤
             </button>
           )}

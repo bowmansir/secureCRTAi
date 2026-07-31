@@ -1,4 +1,11 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+} from "react";
 import * as api from "./api";
 import AiPanel from "./components/AiPanel";
 import CommandPalette from "./components/CommandPalette";
@@ -17,6 +24,13 @@ import ToolsDialog from "./components/ToolsDialog";
 import StatusBar from "./components/StatusBar";
 import TerminalView from "./components/TerminalView";
 import TransferPanel from "./components/TransferPanel";
+import {
+  TerminalSurfaceProvider,
+  useTerminalSurfaces,
+} from "./agent/TerminalSurfaceProvider";
+import { createRemoteFileAttachment } from "./agent/contextAssembler";
+import { resolveAiPresentation } from "./agent/aiPresentation";
+import { MAX_CONTEXT_ATTACHMENTS } from "./agent/surfaceModel";
 import type {
   HostHealthSummary,
   HostHealthView,
@@ -24,6 +38,7 @@ import type {
   SessionProfile,
   Snippet,
   TabInfo,
+  AppTheme,
   TransferItem,
 } from "./types";
 import "./App.css";
@@ -31,7 +46,6 @@ import "./App.css";
 const MAX_CONTEXT_CHARS = 8000;
 const MAX_OPEN_TABS = 20;
 type SplitDirection = "columns" | "rows";
-type AppTheme = "dark" | "midnight" | "light";
 
 interface SplitLayout {
   direction: SplitDirection;
@@ -42,7 +56,9 @@ export default function App() {
   return (
     <ContextMenuProvider>
       <DialogProvider>
-        <AppInner />
+        <TerminalSurfaceProvider>
+          <AppInner />
+        </TerminalSurfaceProvider>
       </DialogProvider>
     </ContextMenuProvider>
   );
@@ -67,16 +83,42 @@ const savePref = (key: string, value: unknown) => {
   }
 };
 
+const loadLegacyTheme = (): AppTheme => {
+  const value = loadPref<unknown>("theme", "dark");
+  return value === "dark" || value === "midnight" || value === "light"
+    ? value
+    : "dark";
+};
+
+const loadLegacyBackgroundThemeId = (): string | null => {
+  const value = loadPref<unknown>("backgroundThemeId", null);
+  return typeof value === "string" && value.trim() && value.length <= 256
+    ? value
+    : null;
+};
+
 function AppInner() {
   const { showMenu } = useContextMenu();
   const { confirm } = useDialogs();
+  const {
+    dispatchToSurface,
+    ensureSurface,
+    getSurface,
+    removeSurface,
+  } = useTerminalSurfaces();
 
   // 可拖拽面板尺寸（持久化）
   const [sidebarWidth, setSidebarWidth] = useState(() => loadPref("sidebarWidth", 240));
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => loadPref("sidebarCollapsed", false));
   const [aiWidth, setAiWidth] = useState(() => loadPref("aiWidth", 340));
   const [transferHeight, setTransferHeight] = useState(() => loadPref("transferHeight", 180));
-  const [theme, setTheme] = useState<AppTheme>(() => loadPref<AppTheme>("theme", "dark"));
+  const [theme, setTheme] = useState<AppTheme>(loadLegacyTheme);
+  const [backgroundThemeId, setBackgroundThemeId] = useState<string | null>(() =>
+    loadLegacyBackgroundThemeId()
+  );
+  const [backgroundImage, setBackgroundImage] = useState<string | null>(null);
+  const backgroundLoadSeq = useRef(0);
+  const themeBootstrapRef = useRef<Promise<void> | null>(null);
   const [sessions, setSessions] = useState<SessionProfile[]>([]);
   const [groups, setGroups] = useState<string[]>([]);
   const [snippets, setSnippets] = useState<Snippet[]>([]);
@@ -95,16 +137,97 @@ function AppInner() {
   const [hostHealth, setHostHealth] = useState<Record<string, HostHealthView>>({});
   const [healthChecking, setHealthChecking] = useState(false);
   const [hasProvider, setHasProvider] = useState(false);
-  const [aiVisible, setAiVisible] = useState(() => loadPref("aiVisible", true));
-  const [aiRequest, setAiRequest] = useState<{ text: string; nonce: number } | null>(null);
+  // Agent-native 版本默认进入终端内联模式。使用新偏好键，避免旧版默认展开
+  // `aiVisible=true` 的残留值在升级后继续遮住内联 Composer。
+  const [aiVisible, setAiVisible] = useState(() =>
+    loadPref("legacyAiPanelVisible", false)
+  );
+  const [aiPanelMounted, setAiPanelMounted] = useState(aiVisible);
+  const [aiRequest, setAiRequest] = useState<{
+    text: string;
+    nonce: number;
+    useAgent?: boolean;
+  } | null>(null);
 
   // 尺寸/显隐变化时持久化
   useEffect(() => savePref("sidebarWidth", sidebarWidth), [sidebarWidth]);
   useEffect(() => savePref("sidebarCollapsed", sidebarCollapsed), [sidebarCollapsed]);
   useEffect(() => savePref("aiWidth", aiWidth), [aiWidth]);
   useEffect(() => savePref("transferHeight", transferHeight), [transferHeight]);
-  useEffect(() => savePref("theme", theme), [theme]);
-  useEffect(() => savePref("aiVisible", aiVisible), [aiVisible]);
+  useEffect(
+    () => savePref("legacyAiPanelVisible", aiVisible),
+    [aiVisible]
+  );
+  useEffect(() => {
+    if (aiVisible) setAiPanelMounted(true);
+  }, [aiVisible]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const bootstrap = async () => {
+      try {
+        const preferences = await api.themeGetPreferences();
+        if (cancelled) return;
+        if (preferences) {
+          setTheme(preferences.colorTheme);
+          setBackgroundThemeId(preferences.backgroundThemeId);
+        } else {
+          await api.themeSetColor(theme);
+          await api.themeSetBackground(backgroundThemeId);
+        }
+        localStorage.removeItem("termai.theme");
+        localStorage.removeItem("termai.backgroundThemeId");
+      } catch (error) {
+        console.error("加载主题配置失败", error);
+      }
+    };
+    themeBootstrapRef.current = bootstrap();
+    return () => {
+      cancelled = true;
+    };
+    // 只在应用启动时读取或迁移一次，后续选择通过配置命令即时保存。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const handleThemeChange = useCallback(async (nextTheme: AppTheme) => {
+    await themeBootstrapRef.current;
+    const preferences = await api.themeSetColor(nextTheme);
+    setTheme(preferences.colorTheme);
+  }, []);
+
+  const handleBackgroundThemeChange = useCallback(
+    async (nextThemeId: string | null) => {
+      await themeBootstrapRef.current;
+      const preferences = await api.themeSetBackground(nextThemeId);
+      setBackgroundThemeId(preferences.backgroundThemeId);
+    },
+    []
+  );
+
+  useEffect(() => {
+    const seq = ++backgroundLoadSeq.current;
+    if (!backgroundThemeId) {
+      setBackgroundImage(null);
+      return;
+    }
+    void api
+      .themeLoadAsset(backgroundThemeId, "art")
+      .then((asset) => {
+        if (seq === backgroundLoadSeq.current) {
+          setBackgroundImage(`data:${asset.mimeType};base64,${asset.base64}`);
+        }
+      })
+      .catch((error) => {
+        if (seq !== backgroundLoadSeq.current) return;
+        setBackgroundImage(null);
+        setBackgroundThemeId(null);
+        void api
+          .themeSetBackground(null)
+          .catch((persistError) =>
+            console.error("清理失效的图片主题配置失败", persistError, error)
+          );
+      });
+  }, [backgroundThemeId]);
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
@@ -120,7 +243,7 @@ function AppInner() {
 
   const askAi = useCallback((text: string) => {
     setAiVisible(true);
-    setAiRequest({ text, nonce: Date.now() });
+    setAiRequest({ text, nonce: Date.now(), useAgent: false });
   }, []);
 
   // 每个标签页的最近输出（AI 上下文）与后端终端 id
@@ -133,6 +256,69 @@ function AppInner() {
     [splitLayouts, tabs]
   );
   const activeRuntimeTabId = activeTab ? activePaneByTab[activeTab] ?? activeTab : null;
+  const attachRemoteFileContext = useCallback(
+    async (input: { sessionId: string; remotePath: string; content: string }) => {
+      const candidates = runtimeTabs.filter(
+        (runtimeTab) =>
+          runtimeTab.kind === "ssh" &&
+          runtimeTab.sessionId === input.sessionId &&
+          runtimeTab.status !== "closed"
+      );
+      const target =
+        candidates.find((candidate) => candidate.tabId === activeRuntimeTabId) ??
+        candidates[0];
+      if (!target) {
+        await confirm({
+          title: "无法添加上下文",
+          message: "请先打开该服务器的 SSH 终端标签，再从 SFTP 添加文件。",
+          okText: "知道了",
+          hideCancel: true,
+        });
+        return;
+      }
+
+      if (
+        (getSurface(target.tabId)?.contextAttachments.length ?? 0) >=
+        MAX_CONTEXT_ATTACHMENTS
+      ) {
+        await confirm({
+          title: "上下文附件已满",
+          message: `当前终端最多保留 ${MAX_CONTEXT_ATTACHMENTS} 个上下文附件，请先移除不再需要的内容。`,
+          okText: "关闭",
+          hideCancel: true,
+        });
+        return;
+      }
+
+      dispatchToSurface(target.tabId, {
+        type: "add-context-attachment",
+        attachment: createRemoteFileAttachment(
+          `context-file:${input.sessionId}:${crypto.randomUUID()}`,
+          input.remotePath,
+          input.content
+        ),
+      });
+      if (getSurface(target.tabId)?.contextPolicy === "none") {
+        dispatchToSurface(target.tabId, {
+          type: "set-context-policy",
+          policy: "recent",
+        });
+      }
+      await confirm({
+        title: "已添加到 Agent 上下文",
+        message: `${input.remotePath}\n\n目标标签：${target.title}`,
+        okText: "完成",
+        hideCancel: true,
+      });
+    },
+    [
+      activeRuntimeTabId,
+      confirm,
+      dispatchToSurface,
+      getSurface,
+      runtimeTabs,
+    ]
+  );
 
   // 有打开中的终端/SFTP 的会话 id，用于侧栏亮绿点。
   // 连接事件偶尔会晚于终端首屏输出；这里按“存在未关闭标签”表示会话正在使用。
@@ -397,6 +583,7 @@ function AppInner() {
       });
       return;
     }
+    if (tab.kind === "local" || tab.kind === "ssh") ensureSurface(tab.tabId);
     setTabs((prev) => [...prev, tab]);
     setActiveTab(tab.tabId);
   };
@@ -467,6 +654,7 @@ function AppInner() {
     for (const id of cleanupIds) {
       outputBuffers.current.delete(id);
       termIds.current.delete(id);
+      removeSurface(id);
     }
     requestCloseAgentKeys(cleanupIds);
     setTerminalSizes((prev) => {
@@ -676,8 +864,16 @@ function AppInner() {
   const activeTabInfo = tabs.find((t) => t.tabId === activeTab) ?? null;
   const activeRuntimeTabInfo =
     activeRuntimeTabId ? runtimeTabs.find((t) => t.tabId === activeRuntimeTabId) ?? activeTabInfo : activeTabInfo;
-  const aiSuppressedBySftp = activeRuntimeTabInfo?.kind === "sftp" || activeRuntimeTabInfo?.kind === "sftp-cli";
-  const aiPanelVisible = aiVisible && !aiSuppressedBySftp;
+  const {
+    legacyPanelMounted,
+    legacyPanelVisible: aiPanelVisible,
+    legacyPanelSuppressed: aiSuppressedBySftp,
+    inlineTerminalEnabled,
+  } = resolveAiPresentation(
+    aiVisible,
+    activeRuntimeTabInfo?.kind,
+    aiPanelMounted
+  );
 
   useEffect(() => {
     if (!aiSuppressedBySftp) return;
@@ -739,6 +935,7 @@ function AppInner() {
       title: `${source.title} #${panes.length + 1}`,
       status: "connecting",
     };
+    ensureSurface(newPane.tabId);
     setSplitLayouts((prev) => ({
       ...prev,
       [parentTab.tabId]: {
@@ -766,6 +963,7 @@ function AppInner() {
     for (const id of cleanupIds) {
       outputBuffers.current.delete(id);
       termIds.current.delete(id);
+      removeSurface(id);
     }
     requestCloseAgentKeys(cleanupIds);
     setTerminalSizes((prev) => {
@@ -931,8 +1129,19 @@ function AppInner() {
     snippets,
   ]);
 
+  const appShellStyle = backgroundImage
+    ? ({
+        "--theme-background-image": `url("${backgroundImage}")`,
+      } as CSSProperties)
+    : undefined;
+
   return (
-    <div className="app-shell" data-theme={theme}>
+    <div
+      className="app-shell"
+      data-theme={theme}
+      data-theme-background={backgroundImage ? "active" : undefined}
+      style={appShellStyle}
+    >
       <div className="app-toolbar">
         <div className="toolbar-group">
           <button className="toolbar-btn command-trigger" onClick={() => setPaletteOpen(true)} title="命令面板 Ctrl+P">
@@ -1091,6 +1300,7 @@ function AppInner() {
                   startTransfer={startTransfer}
                   sessions={sessions}
                   startRemoteTransfer={startRemoteTransfer}
+                  onAttachRemoteFile={attachRemoteFileContext}
                 />
               ) : t.kind === "sftp-cli" ? (
                 <SftpCliView
@@ -1098,6 +1308,7 @@ function AppInner() {
                   tab={t}
                   active={t.tabId === activeTab}
                   theme={theme}
+                  backgroundActive={Boolean(backgroundImage)}
                   onStatus={onStatus}
                   startTransfer={startTransfer}
                 />
@@ -1127,11 +1338,24 @@ function AppInner() {
                           visible={t.tabId === activeTab}
                           active={paneActive}
                           theme={theme}
+                          backgroundActive={Boolean(backgroundImage)}
                           onStatus={onStatus}
                           onOutput={onOutput}
                           registerTermId={registerTermId}
                           onSize={onTerminalSize}
                           onAskAi={askAi}
+                          agentAvailable={
+                            hasProvider &&
+                            pane.kind === "ssh" &&
+                            pane.status === "connected" &&
+                            Boolean(pane.sessionId)
+                          }
+                          inlineAgentEnabled={inlineTerminalEnabled}
+                          sessionProfile={
+                            pane.kind === "ssh"
+                              ? sessions.find((session) => session.id === pane.sessionId)
+                              : undefined
+                          }
                           onOpenSftp={
                             pane.kind === "ssh" && pane.sessionId
                               ? () => {
@@ -1178,7 +1402,7 @@ function AppInner() {
           {aiPanelVisible && (
             <Resizer direction="col" onMove={(d) => setAiWidth((w) => clamp(w - d, 260, 720))} />
           )}
-          {aiVisible && (
+          {legacyPanelMounted && (
             <div
               className={`ai-panel-shell${aiPanelVisible ? "" : " suppressed"}`}
               style={{
@@ -1241,7 +1465,9 @@ function AppInner() {
       {dialog === "settings" && (
         <SettingsDialog
           theme={theme}
-          onThemeChange={setTheme}
+          onThemeChange={handleThemeChange}
+          backgroundThemeId={backgroundThemeId}
+          onBackgroundThemeChange={handleBackgroundThemeChange}
           onClose={() => setDialog("none")}
           onChanged={reloadAiConfig}
           onImported={reloadSessions}

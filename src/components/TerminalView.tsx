@@ -5,15 +5,63 @@ import { WebLinksAddon } from "@xterm/addon-web-links";
 import { SearchAddon } from "@xterm/addon-search";
 import "@xterm/xterm/css/xterm.css";
 import * as api from "../api";
+import { agentChannels } from "../agent/agentChannels";
+import { TerminalAgentRuntime } from "../agent/terminalAgentRuntime";
+import {
+  useTerminalSurface,
+  useTerminalSurfaces,
+} from "../agent/TerminalSurfaceProvider";
 import { SEPARATOR, useContextMenu } from "./ContextMenu";
+import { useDialogs } from "./Dialogs";
 import Icon from "./Icons";
-import type { TabInfo, TermEvent } from "../types";
+import InlineAgentTimeline from "./InlineAgentTimeline";
+import type { SessionProfile, TabInfo, TermEvent } from "../types";
+import {
+  classifyTerminalInput,
+  extractTerminalPromptInput,
+  isLikelyShellPrompt,
+  splitTerminalSubmissionData,
+  stripTerminalControlSequences,
+  updateTerminalInputCapture,
+} from "../terminal/inputRouter";
+import {
+  decideTerminalInput,
+  resolveInputTargetForDisplay,
+  shouldResetManualOverride,
+} from "../terminal/inputDecisionModel";
+import {
+  createShellBlockAttachment,
+  createTerminalSelectionAttachment,
+} from "../agent/contextAssembler";
+import { MAX_CONTEXT_ATTACHMENTS } from "../agent/surfaceModel";
+import {
+  SHELL_BLOCK_OUTPUT_LIMIT,
+  appendShellBlockOutput,
+  completeShellBlock,
+  createShellBlock,
+  isInteractiveShellCommand,
+} from "../terminal/shellBlocks";
+import type {
+  AgentContextPolicy,
+  ContextAttachment,
+  ShellBlock,
+} from "../agent/surfaceModel";
+import type {
+  TerminalInputCapture,
+  TerminalInputMode,
+  TerminalInputTarget,
+} from "../terminal/inputRouter";
+import {
+  getTerminalTheme,
+  type AppTheme,
+} from "../terminal/terminalThemes";
 
 interface Props {
   tab: TabInfo;
   active: boolean;
   visible?: boolean;
   theme: AppTheme;
+  backgroundActive: boolean;
   onStatus: (tabId: string, status: TabInfo["status"], message?: string) => void;
   /** 终端输出回调，用于 AI 上下文缓冲 */
   onOutput: (tabId: string, text: string) => void;
@@ -25,92 +73,76 @@ interface Props {
   onOpenSftp?: () => void;
   /** 把选中文本交给 AI 面板解释 */
   onAskAi: (question: string) => void;
+  /** 当前是否已配置可用的 AI Provider */
+  agentAvailable: boolean;
+  /** 顶部 AI 面板打开时隐藏终端内联 Agent 入口和时间线 */
+  inlineAgentEnabled: boolean;
+  sessionProfile?: SessionProfile;
 }
 
-type AppTheme = "dark" | "midnight" | "light";
+function readCompletedCommandFromTerminal(
+  terminal: Terminal,
+  partialCommand: string
+): string {
+  const partial = partialCommand.trim();
 
-const TERM_THEMES = {
-  dark: {
-    background: "#0d1117",
-    foreground: "#e6edf3",
-    cursor: "#58a6ff",
-    selectionBackground: "#264f78",
-    black: "#484f58",
-    red: "#ff7b72",
-    green: "#3fb950",
-    yellow: "#d29922",
-    blue: "#58a6ff",
-    magenta: "#bc8cff",
-    cyan: "#39c5cf",
-    white: "#b1bac4",
-    brightBlack: "#6e7681",
-    brightRed: "#ffa198",
-    brightGreen: "#56d364",
-    brightYellow: "#e3b341",
-    brightBlue: "#79c0ff",
-    brightMagenta: "#d2a8ff",
-    brightCyan: "#56d4dd",
-    brightWhite: "#f0f6fc",
-  },
-  midnight: {
-    background: "#060a10",
-    foreground: "#dbe7f7",
-    cursor: "#7aa7ff",
-    selectionBackground: "#20365a",
-    black: "#303846",
-    red: "#ff8b84",
-    green: "#4bd06a",
-    yellow: "#d8a84c",
-    blue: "#7aa7ff",
-    magenta: "#b996ff",
-    cyan: "#55d5e0",
-    white: "#c8d4e6",
-    brightBlack: "#5c6878",
-    brightRed: "#ffaea9",
-    brightGreen: "#74e38c",
-    brightYellow: "#efc36c",
-    brightBlue: "#9fc0ff",
-    brightMagenta: "#d5c2ff",
-    brightCyan: "#8ee8ef",
-    brightWhite: "#f4f8ff",
-  },
-  light: {
-    background: "#fbfdff",
-    foreground: "#172033",
-    cursor: "#245dce",
-    selectionBackground: "#c8dcff",
-    black: "#172033",
-    red: "#c3312a",
-    green: "#1c7d3d",
-    yellow: "#9a6700",
-    blue: "#245dce",
-    magenta: "#7a4acb",
-    cyan: "#157f8f",
-    white: "#d6deea",
-    brightBlack: "#65758b",
-    brightRed: "#e04a43",
-    brightGreen: "#269b4d",
-    brightYellow: "#b98210",
-    brightBlue: "#3578f6",
-    brightMagenta: "#9462e8",
-    brightCyan: "#209aaa",
-    brightWhite: "#ffffff",
-  },
-};
+  const buffer = terminal.buffer.active;
+  const cursorRow = buffer.baseY + buffer.cursorY;
+  let firstRow = cursorRow;
+  while (firstRow > 0 && buffer.getLine(firstRow)?.isWrapped) firstRow--;
+
+  let logicalLine = "";
+  for (let row = firstRow; row <= cursorRow; row++) {
+    logicalLine += buffer.getLine(row)?.translateToString(false) ?? "";
+  }
+  return extractTerminalPromptInput(logicalLine, partial);
+}
+
+function preferCompletedCommand(markerCommand: string, terminalCommand: string) {
+  const marker = markerCommand.trim();
+  const completed = terminalCommand.trim();
+  if (completed && marker && completed.startsWith(marker)) return completed;
+  return marker || completed;
+}
+
+function fallbackPrompt(
+  tab: TabInfo,
+  sessionProfile?: SessionProfile,
+  cwd?: string
+): string {
+  if (tab.kind === "local") return "PS>";
+  const username = sessionProfile?.username || "user";
+  const host = sessionProfile?.host || tab.title || "host";
+  const home = username === "root" ? "/root" : `/home/${username}`;
+  const displayCwd = !cwd || cwd === home ? "~" : cwd;
+  return `[${username}@${host} ${displayCwd}]${username === "root" ? "#" : "$"}`;
+}
 
 export default function TerminalView({
   tab,
   active,
   visible,
   theme,
+  backgroundActive,
   onStatus,
   onOutput,
   registerTermId,
   onSize,
   onOpenSftp,
   onAskAi,
+  agentAvailable,
+  inlineAgentEnabled,
+  sessionProfile,
 }: Props) {
   const { showMenu } = useContextMenu();
+  const dialogs = useDialogs();
+  const { dispatchToSurface, getSurface } = useTerminalSurfaces();
+  const isVisible = visible ?? active;
+  const surface = useTerminalSurface(tab.tabId, isVisible);
+  const surfaceRef = useRef(surface);
+  surfaceRef.current = surface;
+  const dialogsRef = useRef(dialogs);
+  dialogsRef.current = dialogs;
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
@@ -123,12 +155,414 @@ export default function TerminalView({
   const disposedRef = useRef(false);
   const attemptsRef = useRef(0);
   const reconnectTimerRef = useRef<number | null>(null);
+  const inputModeRef = useRef<TerminalInputMode>("auto");
+  const agentAvailableRef = useRef(agentAvailable);
+  const inlineAgentEnabledRef = useRef(inlineAgentEnabled);
+  const shellIntegrationReadyRef = useRef(false);
+  const activeShellBlockRef = useRef<ShellBlock | null>(null);
+  const activeShellCommandIdRef = useRef<string | null>(null);
+  const rawTerminalRef = useRef(false);
+  const deferComposerFocusRef = useRef(false);
+  const writeToPtyRef = useRef<(data: string) => void>(() => {});
+  const submitComposerRef = useRef<() => void>(() => {});
+  const handoffToTerminalRef = useRef<(data: string) => Promise<void>>(
+    async () => {}
+  );
+  const composerActiveRef = useRef(false);
+  const promptReadyRef = useRef(false);
+  const inputStartedAtPromptRef = useRef(false);
+  const inputCaptureRef = useRef<TerminalInputCapture>({ text: "", reliable: true });
+  const outputTailRef = useRef("");
+  const rawCommandOutputRef = useRef("");
+  const rawCommandFallbackRef = useRef("");
   // 搜索
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchText, setSearchText] = useState("");
+  const [integrationState, setIntegrationState] = useState<
+    "pending" | "ready" | "raw"
+  >(tab.kind === "ssh" ? "pending" : "raw");
+  const integrationStateRef = useRef<"pending" | "ready" | "raw">(
+    tab.kind === "ssh" ? "pending" : "raw"
+  );
+  const [composerDraft, setComposerDraft] = useState(surface?.draft ?? "");
+  const [promptLabel, setPromptLabel] = useState(() =>
+    fallbackPrompt(tab, sessionProfile, surface?.environment?.cwd)
+  );
+  const composerDraftRef = useRef(surface?.draft ?? "");
+  composerDraftRef.current = composerDraft;
+  const composerInputRef = useRef<HTMLTextAreaElement>(null);
+  const composerHistoryRef = useRef<string[]>([]);
+  const composerHistoryIndexRef = useRef(-1);
   const searchInputRef = useRef<HTMLInputElement>(null);
   const MAX_RECONNECT = 6;
-  const isVisible = visible ?? active;
+  const runtimeRef = useRef<TerminalAgentRuntime | null>(null);
+  if (!runtimeRef.current) {
+    runtimeRef.current = new TerminalAgentRuntime({
+      chat: api.aiChat,
+      channels: agentChannels,
+      getSurface: () => getSurface(tab.tabId),
+      dispatch: dispatchToSurface,
+      requestApproval: async (action, risk) => {
+        const choice = await dialogsRef.current.approval({
+          title: "Agent 命令确认",
+          command: action.command,
+          reason: risk.reason,
+        });
+        if (choice !== "modify") return { decision: choice };
+        const command = await dialogsRef.current.prompt({
+          title: "修改 Agent 命令",
+          defaultValue: action.command,
+          note: "修改后的命令会重新经过风险检查。",
+        });
+        return command?.trim()
+          ? { decision: "modify", command: command.trim() }
+          : { decision: "reject" };
+      },
+    });
+  }
+  const inputMode: TerminalInputMode = surface?.manualOverride ?? "auto";
+  const detectedTarget: TerminalInputTarget =
+    surface?.inputTarget ?? "shell";
+  inputModeRef.current = inputMode;
+
+  const hasAgentConversation =
+    surface?.blocks.some((block) => block.kind !== "shell") ?? false;
+  const inlineTimelineVisible =
+    inlineAgentEnabled &&
+    integrationState === "ready" &&
+    surface?.control !== "raw-terminal" &&
+    hasAgentConversation;
+  const composerActive = inlineTimelineVisible;
+  composerActiveRef.current = composerActive;
+
+  const activeInputTarget = composerActive
+    ? resolveInputTargetForDisplay(
+        {
+          text: composerDraft,
+          agentAvailable,
+          manualOverride: inputMode === "auto" ? null : inputMode,
+          captureReliable: true,
+          agentFollowUp: hasAgentConversation,
+        },
+        detectedTarget
+      )
+    : detectedTarget;
+  const shellBusy =
+    surface?.blocks.some(
+      (block) => block.kind === "shell" && block.status === "running"
+    ) ?? false;
+  const agentActive =
+    surface?.control === "streaming" ||
+    surface?.control === "executing" ||
+    surface?.control === "waiting-approval" ||
+    surface?.control === "paused";
+  const contextAttachments = surface?.contextAttachments ?? [];
+  const attachedBlockIds = contextAttachments.flatMap((attachment) =>
+    attachment.blockId ? [attachment.blockId] : []
+  );
+
+  const setContextPolicy = (policy: AgentContextPolicy) => {
+    dispatchToSurface(tab.tabId, { type: "set-context-policy", policy });
+  };
+
+  const removeContextAttachment = (attachment: ContextAttachment) => {
+    const current = surfaceRef.current;
+    dispatchToSurface(tab.tabId, {
+      type: "remove-context-attachment",
+      attachmentId: attachment.id,
+    });
+    if (
+      current?.contextPolicy === "selected-blocks" &&
+      current.contextAttachments.length === 1
+    ) {
+      setContextPolicy("none");
+    }
+  };
+
+  const toggleBlockContext = (block: ShellBlock) => {
+    const existing = surfaceRef.current?.contextAttachments.find(
+      (attachment) => attachment.blockId === block.id
+    );
+    if (existing) {
+      removeContextAttachment(existing);
+      return;
+    }
+    dispatchToSurface(tab.tabId, {
+      type: "add-context-attachment",
+      attachment: createShellBlockAttachment(block),
+    });
+    if (surfaceRef.current?.contextPolicy === "none") {
+      setContextPolicy("selected-blocks");
+    }
+  };
+
+  const attachTerminalSelection = (selection: string) => {
+    const content = selection.trim();
+    if (!content) return;
+    const current = surfaceRef.current;
+    const existing = current?.contextAttachments.find(
+      (attachment) =>
+        attachment.kind === "selection" && attachment.content === content
+    );
+    if (existing) {
+      if (current?.contextPolicy === "none") {
+        setContextPolicy("selected-blocks");
+      }
+      return;
+    }
+    if (
+      (current?.contextAttachments.length ?? 0) >= MAX_CONTEXT_ATTACHMENTS
+    ) {
+      void dialogs.confirm({
+        title: "上下文附件已满",
+        message: `当前终端最多保留 ${MAX_CONTEXT_ATTACHMENTS} 个上下文附件，请先移除不再需要的内容。`,
+        okText: "关闭",
+        hideCancel: true,
+      });
+      return;
+    }
+    dispatchToSurface(tab.tabId, {
+      type: "add-context-attachment",
+      attachment: createTerminalSelectionAttachment(
+        `context-selection:${tab.tabId}:${Date.now()}`,
+        content
+      ),
+    });
+    if (current?.contextPolicy === "none") {
+      setContextPolicy("selected-blocks");
+    }
+  };
+
+  const showContextAttachment = (attachment: ContextAttachment) => {
+    const block = attachment.blockId
+      ? surfaceRef.current?.blocks.find((item) => item.id === attachment.blockId)
+      : undefined;
+    const content =
+      block?.kind === "shell"
+        ? [
+            `命令：${block.command}`,
+            block.cwd ? `目录：${block.cwd}` : "",
+            `退出码：${block.exitCode ?? "未知"}`,
+            "",
+            block.output || "(无输出)",
+          ]
+            .filter((line) => line !== "")
+            .join("\n")
+        : attachment.content || "(无内容)";
+    void dialogs.confirm({
+      title: attachment.label,
+      message: content,
+      okText: "关闭",
+      hideCancel: true,
+    });
+  };
+
+  const beginShellCommand = (command: string) => {
+    const interactive = isInteractiveShellCommand(command);
+    const block = createShellBlock(
+      `shell-${tab.tabId}-${Date.now()}-${Math.random()
+        .toString(36)
+        .slice(2, 8)}`,
+      command,
+      surfaceRef.current?.environment?.cwd,
+      interactive
+    );
+    activeShellBlockRef.current = block;
+    dispatchToSurface(tab.tabId, { type: "append-block", block });
+    if (interactive) {
+      rawTerminalRef.current = true;
+      dispatchToSurface(tab.tabId, {
+        type: "set-control",
+        control: "raw-terminal",
+      });
+    }
+    writeToPtyRef.current(`${command}\r`);
+  };
+
+  const submitComposer = async () => {
+    const text = composerDraft.trim();
+    if (!text || shellBusy || !composerActive) return;
+    const submitDecision = decideTerminalInput({
+      text,
+      agentAvailable:
+        agentAvailableRef.current && integrationStateRef.current !== "raw",
+      manualOverride:
+        inputModeRef.current === "auto" ? null : inputModeRef.current,
+      captureReliable: true,
+      agentFollowUp:
+        surfaceRef.current?.blocks.some((block) => block.kind !== "shell") ??
+        false,
+    });
+
+    composerDraftRef.current = "";
+    setComposerDraft("");
+    dispatchToSurface(tab.tabId, { type: "set-draft", draft: "" });
+    composerHistoryIndexRef.current = -1;
+    if (inputModeRef.current !== "auto") setInputMode("auto");
+    dispatchToSurface(tab.tabId, {
+      type: "set-input-target",
+      target: submitDecision.target,
+    });
+
+    if (submitDecision.target === "agent" && tab.sessionId) {
+      await runtimeRef.current?.submit({
+        surfaceId: tab.tabId,
+        sessionId: tab.sessionId,
+        prompt: text,
+      });
+      return;
+    }
+
+    if (agentActive) await runtimeRef.current?.stop(tab.tabId);
+    composerHistoryRef.current = [
+      text,
+      ...composerHistoryRef.current.filter((item) => item !== text),
+    ].slice(0, 100);
+    beginShellCommand(text);
+  };
+  submitComposerRef.current = () => {
+    void submitComposer();
+  };
+
+  const handoffToTerminal = async (data: string) => {
+    if (!composerActive) return;
+    const draft = composerDraftRef.current;
+    if (agentActive) {
+      await runtimeRef.current?.stop(tab.tabId);
+      if (disposedRef.current) return;
+    }
+    if (inputModeRef.current !== "auto") setInputMode("auto");
+    composerDraftRef.current = "";
+    setComposerDraft("");
+    dispatchToSurface(tab.tabId, { type: "set-draft", draft: "" });
+    dispatchToSurface(tab.tabId, {
+      type: "set-control",
+      control: "raw-terminal",
+    });
+    rawTerminalRef.current = true;
+    inputStartedAtPromptRef.current = true;
+    inputCaptureRef.current = { text: draft, reliable: false };
+    rawCommandOutputRef.current = "";
+    rawCommandFallbackRef.current = draft.trim();
+    writeToPtyRef.current(`${draft}${data}`);
+    window.setTimeout(() => termRef.current?.focus(), 0);
+  };
+  handoffToTerminalRef.current = handoffToTerminal;
+
+  const setInputMode = (mode: TerminalInputMode) => {
+    inputModeRef.current = mode;
+    const inputText = composerActiveRef.current
+      ? composerDraftRef.current
+      : inputCaptureRef.current.text;
+    const target = resolveInputTargetForDisplay(
+      {
+        text: inputText,
+        agentAvailable:
+          agentAvailableRef.current && integrationStateRef.current !== "raw",
+        manualOverride: mode === "auto" ? null : mode,
+        captureReliable: composerActiveRef.current
+          ? true
+          : inputCaptureRef.current.reliable,
+        agentFollowUp:
+          surfaceRef.current?.blocks.some((block) => block.kind !== "shell") ??
+          false,
+      },
+      surfaceRef.current?.inputTarget ?? "shell"
+    );
+    dispatchToSurface(tab.tabId, {
+      type: "set-manual-override",
+      target: mode === "auto" ? null : mode,
+    });
+    dispatchToSurface(tab.tabId, { type: "set-input-target", target });
+    if (composerActiveRef.current) {
+      window.setTimeout(() => composerInputRef.current?.focus(), 0);
+    } else {
+      termRef.current?.focus();
+    }
+  };
+
+  const updateComposerDraft = (nextDraft: string) => {
+    const previousDraft = composerDraftRef.current;
+    composerDraftRef.current = nextDraft;
+    if (
+      inputModeRef.current !== "auto" &&
+      shouldResetManualOverride(previousDraft, nextDraft)
+    ) {
+      setInputMode("auto");
+    }
+    setComposerDraft(nextDraft);
+  };
+
+  useEffect(() => {
+    agentAvailableRef.current = agentAvailable;
+    if (!agentAvailable) {
+      if (inputModeRef.current === "agent") {
+        setInputMode("auto");
+      } else {
+        dispatchToSurface(tab.tabId, {
+          type: "set-input-target",
+          target: "shell",
+        });
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agentAvailable, dispatchToSurface, tab.tabId]);
+
+  useEffect(() => {
+    inlineAgentEnabledRef.current = inlineAgentEnabled;
+    if (!inlineAgentEnabled) termRef.current?.focus();
+  }, [inlineAgentEnabled]);
+
+  useEffect(() => {
+    dispatchToSurface(tab.tabId, {
+      type: "set-input-target",
+      target: activeInputTarget,
+    });
+  }, [activeInputTarget, dispatchToSurface, tab.tabId]);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      dispatchToSurface(tab.tabId, {
+        type: "set-draft",
+        draft: composerDraft,
+      });
+    }, 120);
+    return () => window.clearTimeout(timer);
+  }, [composerDraft, dispatchToSurface, tab.tabId]);
+
+  useEffect(() => {
+    if (!active) return;
+    const delay = composerActive && deferComposerFocusRef.current ? 100 : 0;
+    if (composerActive) deferComposerFocusRef.current = false;
+    const timer = window.setTimeout(() => {
+      if (composerActive) composerInputRef.current?.focus();
+      else termRef.current?.focus();
+    }, delay);
+    return () => window.clearTimeout(timer);
+  }, [active, composerActive]);
+
+  useEffect(() => {
+    dispatchToSurface(tab.tabId, {
+      type: "set-environment",
+      environment: {
+        kind: tab.kind === "ssh" ? "ssh" : "local",
+        sessionId: tab.sessionId,
+        host: sessionProfile?.host,
+        port: sessionProfile?.port,
+        username: sessionProfile?.username,
+        connected: tab.status === "connected",
+      },
+    });
+  }, [
+    dispatchToSurface,
+    sessionProfile?.host,
+    sessionProfile?.port,
+    sessionProfile?.username,
+    tab.kind,
+    tab.sessionId,
+    tab.status,
+    tab.tabId,
+  ]);
 
   useEffect(() => {
     if (!containerRef.current || openedRef.current) return;
@@ -137,8 +571,9 @@ export default function TerminalView({
     const term = new Terminal({
       fontFamily: '"JetBrains Mono", "Cascadia Mono", Consolas, monospace',
       fontSize: 14,
-      theme: TERM_THEMES[theme],
+      theme: getTerminalTheme(theme, backgroundActive),
       cursorBlink: true,
+      allowTransparency: true,
       allowProposedApi: true,
       scrollback: 10000,
     });
@@ -165,14 +600,227 @@ export default function TerminalView({
       if (e.type === "data") {
         const bytes = new Uint8Array(e.bytes);
         term.write(bytes);
-        onOutput(tab.tabId, decoder.current.decode(bytes, { stream: true }));
+        const text = decoder.current.decode(bytes, { stream: true });
+        onOutput(tab.tabId, text);
+        const activeShellBlock = activeShellBlockRef.current;
+        if (
+          activeShellBlock &&
+          e.commandId &&
+          e.commandId === activeShellCommandIdRef.current
+        ) {
+          const nextBlock = appendShellBlockOutput(activeShellBlock, text);
+          if (nextBlock !== activeShellBlock) {
+            activeShellBlockRef.current = nextBlock;
+            dispatchToSurface(tab.tabId, {
+              type: "replace-block",
+              block: nextBlock,
+            });
+          }
+        } else if (rawTerminalRef.current && !e.commandId) {
+          const combined = rawCommandOutputRef.current + text;
+          rawCommandOutputRef.current =
+            combined.length <= SHELL_BLOCK_OUTPUT_LIMIT
+              ? combined
+              : combined.slice(-SHELL_BLOCK_OUTPUT_LIMIT);
+        }
+        outputTailRef.current = (outputTailRef.current + text).slice(-1200);
+        if (!inputStartedAtPromptRef.current) {
+          promptReadyRef.current = isLikelyShellPrompt(outputTailRef.current);
+          if (promptReadyRef.current) {
+            const cleanTail = stripTerminalControlSequences(outputTailRef.current);
+            const promptLines = cleanTail.split("\n");
+            const nextPrompt = promptLines[promptLines.length - 1]?.trimEnd();
+            if (nextPrompt) setPromptLabel(nextPrompt);
+          }
+        }
       } else if (e.type === "connected") {
         const reconnected = wasConnectedRef.current;
         wasConnectedRef.current = true;
         attemptsRef.current = 0;
         onStatus(tab.tabId, "connected");
         if (reconnected) term.write("\r\n\x1b[32m[已重新连接]\x1b[0m\r\n");
+      } else if (e.type === "shellIntegration") {
+        shellIntegrationReadyRef.current = e.available;
+        integrationStateRef.current = e.available ? "ready" : "raw";
+        setIntegrationState(e.available ? "ready" : "raw");
+        if (!e.available && inputModeRef.current !== "auto") {
+          setInputMode("auto");
+        }
+        const currentEnvironment = surfaceRef.current?.environment;
+        dispatchToSurface(tab.tabId, {
+          type: "set-environment",
+          environment: {
+            kind: "ssh",
+            sessionId: tab.sessionId,
+            host: sessionProfile?.host,
+            port: sessionProfile?.port,
+            username: sessionProfile?.username,
+            connected: true,
+            cwd: currentEnvironment?.cwd,
+            shell: e.shell ?? currentEnvironment?.shell,
+            os: currentEnvironment?.os,
+          },
+        });
+      } else if (e.type === "shellCommand") {
+        const command = preferCompletedCommand(
+          e.command,
+          rawCommandFallbackRef.current
+        );
+        if (command) {
+          let existingBlock = activeShellBlockRef.current;
+          const currentCommandId = activeShellCommandIdRef.current;
+          if (
+            existingBlock &&
+            currentCommandId &&
+            currentCommandId !== e.commandId
+          ) {
+            dispatchToSurface(tab.tabId, {
+              type: "replace-block",
+              block: {
+                ...existingBlock,
+                status: "error",
+                output: `${existingBlock.output}\n[未收到命令完成事件]`.trim(),
+              },
+            });
+            existingBlock = null;
+          }
+          const interactive = isInteractiveShellCommand(command);
+          const block = existingBlock
+            ? {
+                ...existingBlock,
+                commandId: e.commandId,
+                command,
+                output: "",
+                interactive,
+                collapsed: interactive,
+              }
+            : createShellBlock(
+                `shell-${tab.tabId}-${e.commandId}`,
+                command,
+                surfaceRef.current?.environment?.cwd,
+                interactive,
+                e.commandId
+              );
+          rawCommandOutputRef.current = "";
+          rawCommandFallbackRef.current = command;
+          activeShellBlockRef.current = block;
+          activeShellCommandIdRef.current = e.commandId;
+          dispatchToSurface(tab.tabId, {
+            type: existingBlock ? "replace-block" : "append-block",
+            block,
+          });
+          if (interactive) {
+            rawTerminalRef.current = true;
+            dispatchToSurface(tab.tabId, {
+              type: "set-control",
+              control: "raw-terminal",
+            });
+          }
+        }
+      } else if (e.type === "shellPrompt") {
+        shellIntegrationReadyRef.current = true;
+        integrationStateRef.current = "ready";
+        setIntegrationState("ready");
+        promptReadyRef.current = true;
+        inputStartedAtPromptRef.current = false;
+        inputCaptureRef.current = { text: "", reliable: true };
+        dispatchToSurface(tab.tabId, {
+          type: "set-input-target",
+          target: "shell",
+        });
+
+        const promptMatchesActiveCommand =
+          activeShellCommandIdRef.current === null
+            ? !e.commandId
+            : e.commandId === activeShellCommandIdRef.current;
+        const activeShellBlock = promptMatchesActiveCommand
+          ? activeShellBlockRef.current
+          : null;
+        const completedRawCommand =
+          e.command?.trim() || rawCommandFallbackRef.current;
+        const shouldRestoreInlineSurface =
+          rawTerminalRef.current ||
+          activeShellBlock?.interactive === true ||
+          surfaceRef.current?.control === "raw-terminal";
+        rawTerminalRef.current = false;
+        if (shouldRestoreInlineSurface) deferComposerFocusRef.current = true;
+        if (activeShellBlock) {
+          const completed = completeShellBlock(
+            activeShellBlock,
+            e.exitCode,
+            e.cwd
+          );
+          activeShellBlockRef.current = null;
+          activeShellCommandIdRef.current = null;
+          dispatchToSurface(tab.tabId, {
+            type: "replace-block",
+            block: completed,
+          });
+        } else if (shouldRestoreInlineSurface && completedRawCommand) {
+          const interactive = isInteractiveShellCommand(completedRawCommand);
+          const started = createShellBlock(
+            `shell-${tab.tabId}-${Date.now()}-${Math.random()
+              .toString(36)
+              .slice(2, 8)}`,
+            completedRawCommand,
+            surfaceRef.current?.environment?.cwd,
+            interactive
+          );
+          const withOutput = appendShellBlockOutput(
+            started,
+            rawCommandOutputRef.current
+          );
+          dispatchToSurface(tab.tabId, {
+            type: "append-block",
+            block: completeShellBlock(withOutput, e.exitCode, e.cwd),
+          });
+        }
+        rawCommandOutputRef.current = "";
+        rawCommandFallbackRef.current = "";
+        if (activeShellBlock || shouldRestoreInlineSurface) {
+          dispatchToSurface(tab.tabId, { type: "set-control", control: "idle" });
+        }
+
+        const currentEnvironment = surfaceRef.current?.environment;
+        dispatchToSurface(tab.tabId, {
+          type: "set-environment",
+          environment: {
+            kind: "ssh",
+            sessionId: tab.sessionId,
+            host: sessionProfile?.host,
+            port: sessionProfile?.port,
+            username: sessionProfile?.username,
+            connected: true,
+            cwd: e.cwd,
+            shell: currentEnvironment?.shell,
+            os: currentEnvironment?.os,
+          },
+        });
       } else if (e.type === "exit") {
+        void runtimeRef.current?.stop(tab.tabId);
+        const activeShellBlock = activeShellBlockRef.current;
+        const shouldRestoreInlineSurface =
+          rawTerminalRef.current ||
+          activeShellBlock?.interactive === true ||
+          surfaceRef.current?.control === "raw-terminal";
+        rawTerminalRef.current = false;
+        rawCommandOutputRef.current = "";
+        rawCommandFallbackRef.current = "";
+        if (activeShellBlock) {
+          activeShellBlockRef.current = null;
+          activeShellCommandIdRef.current = null;
+          dispatchToSurface(tab.tabId, {
+            type: "replace-block",
+            block: {
+              ...activeShellBlock,
+              status: "error",
+              output: `${activeShellBlock.output}\n[终端连接已断开]`.trim(),
+            },
+          });
+        }
+        if (activeShellBlock || shouldRestoreInlineSurface) {
+          dispatchToSurface(tab.tabId, { type: "set-control", control: "idle" });
+        }
         // 本地终端、用户主动关闭、从未连接成功：不重连
         if (tab.kind === "local" || disposedRef.current || !wasConnectedRef.current) {
           onStatus(tab.tabId, "closed", e.message ?? undefined);
@@ -203,6 +851,10 @@ export default function TerminalView({
     }
 
     function connect() {
+      shellIntegrationReadyRef.current = false;
+      activeShellCommandIdRef.current = null;
+      integrationStateRef.current = tab.kind === "ssh" ? "pending" : "raw";
+      setIntegrationState(integrationStateRef.current);
       const p =
         tab.kind === "local"
           ? api.openLocalTerminal(term.cols, term.rows, handleEvent)
@@ -225,9 +877,180 @@ export default function TerminalView({
 
     connect();
 
+    let writeQueue = Promise.resolve();
+    const writeToPty = (data: string) => {
+      writeQueue = writeQueue
+        .then(() => {
+          const id = termIdRef.current;
+          return id ? api.termWrite(id, data) : Promise.resolve();
+        })
+        .catch(() => {});
+    };
+    writeToPtyRef.current = writeToPty;
+
+    const resetInputCapture = (keepPromptReady = false) => {
+      inputCaptureRef.current = { text: "", reliable: true };
+      inputStartedAtPromptRef.current = false;
+      promptReadyRef.current = keepPromptReady;
+    };
+
     const dataSub = term.onData((data) => {
-      const id = termIdRef.current;
-      if (id) api.termWrite(id, data).catch(() => {});
+      if (composerActiveRef.current) {
+        if (data === "\r" || data === "\n") {
+          submitComposerRef.current();
+        } else if (data === "\t" || data.startsWith("\x1b")) {
+          void handoffToTerminalRef.current(data);
+        } else if (data === "\x03" || data === "\x15") {
+          updateComposerDraft("");
+        } else if (data === "\x7f" || data === "\b") {
+          updateComposerDraft(
+            Array.from(composerDraftRef.current).slice(0, -1).join("")
+          );
+        } else {
+          const printable = data.replace(/[\x00-\x1f\x7f]/g, "");
+          if (printable) {
+            updateComposerDraft(composerDraftRef.current + printable);
+          }
+        }
+        return;
+      }
+
+      if (rawTerminalRef.current) {
+        writeToPty(data);
+        return;
+      }
+
+      const submission = splitTerminalSubmissionData(data);
+      if (submission) {
+        if (submission.input) {
+          const printableInput = submission.input
+            .replace(/\x1b\[200~/g, "")
+            .replace(/\x1b\[201~/g, "")
+            .replace(/[\x00-\x1f\x7f]/g, "");
+          const promptIsReady =
+            promptReadyRef.current ||
+            isLikelyShellPrompt(outputTailRef.current);
+          if (
+            !inputStartedAtPromptRef.current &&
+            promptIsReady &&
+            printableInput
+          ) {
+            promptReadyRef.current = true;
+            inputStartedAtPromptRef.current = true;
+            inputCaptureRef.current = { text: "", reliable: true };
+          }
+          if (inputStartedAtPromptRef.current) {
+            inputCaptureRef.current = updateTerminalInputCapture(
+              inputCaptureRef.current,
+              submission.input
+            );
+          }
+        }
+
+        const capture = inputCaptureRef.current;
+        const bufferedCommand = readCompletedCommandFromTerminal(
+          term,
+          rawCommandFallbackRef.current || capture.text
+        );
+        if (bufferedCommand) rawCommandFallbackRef.current = bufferedCommand;
+        const submittedText = bufferedCommand || capture.text.trim();
+        const recoveredFromTerminal = Boolean(bufferedCommand);
+        const canRoute =
+          Boolean(submittedText) &&
+          ((inputStartedAtPromptRef.current && capture.reliable) ||
+            recoveredFromTerminal);
+        const decision = classifyTerminalInput(
+          submittedText,
+          inputModeRef.current,
+          agentAvailableRef.current && integrationStateRef.current !== "raw"
+        );
+
+        if (
+          inlineAgentEnabledRef.current &&
+          canRoute &&
+          decision.target === "agent" &&
+          tab.sessionId
+        ) {
+          writeToPty("\x15");
+          const prompt = submittedText;
+          resetInputCapture(true);
+          if (inputModeRef.current !== "auto") setInputMode("auto");
+          dispatchToSurface(tab.tabId, {
+            type: "set-input-target",
+            target: decision.target,
+          });
+          void runtimeRef.current
+            ?.submit({
+              surfaceId: tab.tabId,
+              sessionId: tab.sessionId,
+              prompt,
+            })
+            .catch(() => {});
+          return;
+        }
+
+        if (
+          shellIntegrationReadyRef.current &&
+          canRoute &&
+          decision.target === "shell"
+        ) {
+          const command = submittedText;
+          const interactive = isInteractiveShellCommand(command);
+          const block = createShellBlock(
+            `shell-${tab.tabId}-${Date.now()}-${Math.random()
+              .toString(36)
+              .slice(2, 8)}`,
+            command,
+            surfaceRef.current?.environment?.cwd,
+            interactive
+          );
+          activeShellBlockRef.current = block;
+          dispatchToSurface(tab.tabId, { type: "append-block", block });
+          if (interactive) {
+            rawTerminalRef.current = true;
+            dispatchToSurface(tab.tabId, {
+              type: "set-control",
+              control: "raw-terminal",
+            });
+          }
+        }
+
+        writeToPty(data);
+        resetInputCapture(false);
+        if (inputModeRef.current !== "auto") setInputMode("auto");
+        dispatchToSurface(tab.tabId, {
+          type: "set-input-target",
+          target: decision.target,
+        });
+        return;
+      }
+
+      const printableData = data
+        .replace(/\x1b\[200~/g, "")
+        .replace(/\x1b\[201~/g, "")
+        .replace(/[\x00-\x1f\x7f]/g, "");
+      if (!inputStartedAtPromptRef.current && promptReadyRef.current && printableData) {
+        inputStartedAtPromptRef.current = true;
+        inputCaptureRef.current = { text: "", reliable: true };
+      }
+
+      if (inputStartedAtPromptRef.current) {
+        inputCaptureRef.current = updateTerminalInputCapture(inputCaptureRef.current, data);
+        dispatchToSurface(tab.tabId, {
+          type: "set-input-target",
+          target: classifyTerminalInput(
+            inputCaptureRef.current.text,
+            inputModeRef.current,
+            agentAvailableRef.current && integrationStateRef.current !== "raw"
+          ).target,
+        });
+      }
+
+      writeToPty(data);
+      if (data.includes("\x03")) resetInputCapture(false);
+      if (data.includes("\x15") && inputModeRef.current !== "auto") {
+        setInputMode("auto");
+      }
     });
 
     const resizeSub = term.onResize(({ cols, rows }) => {
@@ -269,6 +1092,11 @@ export default function TerminalView({
         return false;
       }
 
+      if ((ev.ctrlKey || ev.metaKey) && ev.shiftKey && key === "i") {
+        setInputMode(inputModeRef.current === "agent" ? "auto" : "agent");
+        return false;
+      }
+
       if (ev.key === "Tab" && !ev.ctrlKey && !ev.altKey && !ev.metaKey) {
         ev.preventDefault();
         ev.stopPropagation();
@@ -296,6 +1124,9 @@ export default function TerminalView({
       observer.disconnect();
       const id = termIdRef.current;
       if (id) api.termClose(id).catch(() => {});
+      activeShellCommandIdRef.current = null;
+      writeToPtyRef.current = () => {};
+      void runtimeRef.current?.dispose(tab.tabId);
       term.dispose();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -307,14 +1138,13 @@ export default function TerminalView({
       const term = termRef.current;
       if (term) onSize?.(tab.tabId, term.cols, term.rows);
     }
-    if (active) {
-      termRef.current?.focus();
-    }
-  }, [active, isVisible, onSize, tab.tabId]);
+  }, [active, composerActive, isVisible, onSize, tab.tabId]);
 
   useEffect(() => {
-    if (termRef.current) termRef.current.options.theme = TERM_THEMES[theme];
-  }, [theme]);
+    if (termRef.current) {
+      termRef.current.options.theme = getTerminalTheme(theme, backgroundActive);
+    }
+  }, [backgroundActive, theme]);
 
   const menu = (e: React.MouseEvent) => {
     const term = termRef.current;
@@ -348,6 +1178,11 @@ export default function TerminalView({
       SEPARATOR,
       ...(onOpenSftp ? [{ label: "打开 SFTP 面板", onClick: onOpenSftp }, SEPARATOR] : []),
       {
+        label: "添加选中内容到 Agent 上下文",
+        disabled: !selection || !inlineAgentEnabled || !agentAvailable,
+        onClick: () => attachTerminalSelection(selection),
+      },
+      {
         label: "AI 解释选中内容",
         disabled: !selection,
         onClick: () => onAskAi(`请解释这段终端内容：\n\`\`\`\n${selection}\n\`\`\``),
@@ -379,7 +1214,56 @@ export default function TerminalView({
   };
 
   return (
-    <div className="terminal-wrapper" style={{ display: isVisible ? "block" : "none" }}>
+    <div
+      className={`terminal-wrapper${inlineAgentEnabled ? " inline-agent-enabled" : ""}${
+        contextAttachments.length > 0 ? " has-context-attachments" : ""
+      }${
+        surface?.contextPolicy === "none" ? " context-disabled" : ""
+      }${
+        isVisible && inlineTimelineVisible
+          ? " has-agent-timeline"
+          : ""
+      }`}
+      style={{ display: isVisible ? "block" : "none" }}
+    >
+      {isVisible && inlineAgentEnabled && (
+        <div className="terminal-mode-bar">
+          <div
+            className="terminal-mode-segments"
+            role="group"
+            aria-label="终端输入模式"
+          >
+            {(["shell", "agent"] as TerminalInputTarget[]).map((mode) => {
+              const label = mode === "shell" ? "Shell" : "Agent";
+              return (
+                <button
+                  key={mode}
+                  type="button"
+                  className={`terminal-mode-option${
+                    mode === activeInputTarget ? " active" : ""
+                  }`}
+                  disabled={mode === "agent" && !agentAvailable}
+                  title={
+                    mode === "agent" && !agentAvailable
+                      ? "Agent（请先配置 AI Provider）"
+                      : label
+                  }
+                  aria-label={label}
+                  aria-pressed={mode === activeInputTarget}
+                  onClick={() =>
+                    setInputMode(inputMode === mode ? "auto" : mode)
+                  }
+                >
+                  <Icon
+                    name={mode === "shell" ? "terminal" : "ai"}
+                    size={14}
+                  />
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      )}
       {searchOpen && (
         <div className="term-search">
           <input
@@ -420,6 +1304,172 @@ export default function TerminalView({
         </div>
       )}
       <div ref={containerRef} className="terminal-container" onContextMenu={menu} />
+      {isVisible && inlineTimelineVisible && surface && (
+        <InlineAgentTimeline
+          blocks={surface.blocks}
+          control={surface.control}
+          promptLabel={promptLabel}
+          attachedBlockIds={attachedBlockIds}
+          onToggleBlockContext={toggleBlockContext}
+          onToggleShell={(block) =>
+            dispatchToSurface(tab.tabId, {
+              type: "replace-block",
+              block: { ...block, collapsed: !block.collapsed },
+            })
+          }
+          onToggleExecution={(block) =>
+            dispatchToSurface(tab.tabId, {
+              type: "replace-block",
+              block: { ...block, collapsed: !block.collapsed },
+            })
+          }
+          onContinue={() => {
+            void runtimeRef.current?.continue(tab.tabId);
+          }}
+          onEnd={() => {
+            void runtimeRef.current?.end(tab.tabId);
+          }}
+          onStop={() => {
+            void runtimeRef.current?.stop(tab.tabId);
+          }}
+        >
+          {composerActive && (
+            <div className="terminal-native-input">
+              {contextAttachments.length > 0 && (
+                <div
+                  className="terminal-context-chips"
+                  aria-label="Agent 上下文附件"
+                >
+                  <label
+                    className={`terminal-context-policy${
+                      surface?.contextPolicy === "none" ? " off" : ""
+                    }`}
+                    title="选择 Agent 使用的终端上下文"
+                  >
+                    <span>上下文 {contextAttachments.length}</span>
+                    <select
+                      aria-label="Agent 终端上下文策略"
+                      value={surface?.contextPolicy ?? "recent"}
+                      onChange={(event) =>
+                        setContextPolicy(
+                          event.target.value as AgentContextPolicy
+                        )
+                      }
+                    >
+                      <option value="none">关闭上下文</option>
+                      <option value="recent">最近输出 + 已选内容</option>
+                      <option value="selected-blocks">仅已选内容</option>
+                    </select>
+                  </label>
+                  {contextAttachments.map((attachment) => (
+                    <div className="terminal-context-chip" key={attachment.id}>
+                      <button
+                        type="button"
+                        className="terminal-context-chip-label"
+                        title="查看上下文内容"
+                        onClick={() => showContextAttachment(attachment)}
+                      >
+                        {attachment.label}
+                      </button>
+                      <button
+                        type="button"
+                        className="terminal-context-chip-remove"
+                        title="移除上下文"
+                        aria-label={`移除上下文 ${attachment.label}`}
+                        onClick={() => removeContextAttachment(attachment)}
+                      >
+                        <Icon name="close" size={11} />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <div className="terminal-native-input-row">
+                <code className="terminal-native-prompt">{promptLabel}</code>
+                <textarea
+                  ref={composerInputRef}
+                  value={composerDraft}
+                  rows={1}
+                  spellCheck={false}
+                  aria-label="终端输入"
+                  placeholder={
+                    agentAvailable
+                      ? "输入自然语言或命令"
+                      : "输入 Shell 命令"
+                  }
+                  onChange={(event) => updateComposerDraft(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (
+                      event.key === "Enter" &&
+                      !event.shiftKey &&
+                      !event.nativeEvent.isComposing
+                    ) {
+                      event.preventDefault();
+                      void submitComposer();
+                      return;
+                    }
+                    if (event.key === "Tab") {
+                      event.preventDefault();
+                      void handoffToTerminal("\t");
+                      return;
+                    }
+                    if (
+                      (event.ctrlKey || event.metaKey) &&
+                      event.shiftKey &&
+                      event.key.toLowerCase() === "i"
+                    ) {
+                      event.preventDefault();
+                      setInputMode(inputMode === "agent" ? "auto" : "agent");
+                      return;
+                    }
+                    if (
+                      event.key === "ArrowUp" &&
+                      !event.shiftKey &&
+                      !composerDraft.includes("\n")
+                    ) {
+                      const history = composerHistoryRef.current;
+                      if (history.length > 0) {
+                        event.preventDefault();
+                        const next = Math.min(
+                          history.length - 1,
+                          composerHistoryIndexRef.current + 1
+                        );
+                        composerHistoryIndexRef.current = next;
+                        updateComposerDraft(history[next]);
+                      }
+                      return;
+                    }
+                    if (
+                      event.key === "ArrowDown" &&
+                      !event.shiftKey &&
+                      composerHistoryIndexRef.current >= 0
+                    ) {
+                      event.preventDefault();
+                      const next = composerHistoryIndexRef.current - 1;
+                      composerHistoryIndexRef.current = next;
+                      updateComposerDraft(
+                        next >= 0 ? composerHistoryRef.current[next] : ""
+                      );
+                    }
+                  }}
+                />
+                {shellBusy && (
+                  <span className="terminal-native-input-status">
+                    等待命令结束
+                  </span>
+                )}
+              </div>
+            </div>
+          )}
+        </InlineAgentTimeline>
+      )}
+      {isVisible && inlineAgentEnabled && integrationState !== "ready" && (
+        <div className={`terminal-integration-status ${integrationState}`}>
+          {integrationState === "pending"
+            ? "正在检测 Shell Integration"
+            : "Raw Terminal"}
+        </div>
+      )}
     </div>
   );
 }

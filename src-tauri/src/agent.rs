@@ -27,6 +27,9 @@ enum AgentCmd {
         command: String,
         reply: oneshot::Sender<anyhow::Result<AgentRunResult>>,
     },
+    Interrupt {
+        reply: oneshot::Sender<anyhow::Result<()>>,
+    },
     Close,
 }
 
@@ -41,6 +44,14 @@ impl AgentSession {
             .send(AgentCmd::Run { command, reply })
             .map_err(|_| anyhow!("Agent 通道已关闭"))?;
         rx.await.map_err(|_| anyhow!("Agent 执行无响应"))?
+    }
+
+    pub async fn interrupt(&self) -> anyhow::Result<()> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(AgentCmd::Interrupt { reply })
+            .map_err(|_| anyhow!("Agent 通道已关闭"))?;
+        rx.await.map_err(|_| anyhow!("Agent 中断无响应"))?
     }
 
     pub fn close(&self) {
@@ -275,6 +286,66 @@ pub async fn open(
                                     _ => {}
                                 }
                             }
+                            control = rx.recv() => {
+                                match control {
+                                    Some(AgentCmd::Interrupt { reply: interrupt_reply }) => {
+                                        let cleanup_marker = gen_marker("INT");
+                                        let _ = channel.data(&[3u8][..]).await;
+                                        let cleanup_cmd = format!("\necho {cleanup_marker}$?\n");
+                                        let _ = channel.data(cleanup_cmd.as_bytes()).await;
+
+                                        let cleanup_timeout = sleep(AGENT_INTERRUPT_GRACE);
+                                        tokio::pin!(cleanup_timeout);
+                                        let recovered_output = loop {
+                                            tokio::select! {
+                                                _ = &mut cleanup_timeout => {
+                                                    close_channel = true;
+                                                    let s = String::from_utf8_lossy(&strip_ansi(&rbuf)).trim().to_string();
+                                                    break s;
+                                                }
+                                                msg = channel.wait() => {
+                                                    match msg {
+                                                        Some(ChannelMsg::Data { data }) => {
+                                                            rbuf.extend_from_slice(&data);
+                                                            let s = String::from_utf8_lossy(&strip_ansi(&rbuf)).to_string();
+                                                            if let Some((pos, _code)) = find_marker(&s, &cleanup_marker) {
+                                                                break s[..pos].trim_matches(['\n', ' ', '\t']).to_string();
+                                                            }
+                                                        }
+                                                        Some(ChannelMsg::ExtendedData { data, .. }) => {
+                                                            rbuf.extend_from_slice(&data);
+                                                        }
+                                                        Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => {
+                                                            close_channel = true;
+                                                            let s = String::from_utf8_lossy(&strip_ansi(&rbuf)).trim().to_string();
+                                                            break s;
+                                                        }
+                                                        _ => {}
+                                                    }
+                                                }
+                                            }
+                                        };
+                                        let _ = interrupt_reply.send(Ok(()));
+                                        let note = if close_channel {
+                                            "Agent 命令已由用户中断，执行通道已关闭。"
+                                        } else {
+                                            "Agent 命令已由用户中断。"
+                                        };
+                                        break Ok(AgentRunResult {
+                                            output: append_agent_note(recovered_output, note),
+                                            exit_code: None,
+                                        });
+                                    }
+                                    Some(AgentCmd::Close) | None => {
+                                        let _ = channel.data(&[3u8][..]).await;
+                                        close_channel = true;
+                                        break Err(anyhow!("Agent 通道已关闭"));
+                                    }
+                                    Some(AgentCmd::Run { reply: queued_reply, .. }) => {
+                                        let _ = queued_reply.send(Err(anyhow!("Agent 正在执行另一条命令")));
+                                    }
+                                }
+                            }
                         }
                     };
                     let _ = reply.send(result);
@@ -287,9 +358,33 @@ pub async fn open(
                     let _ = channel.eof().await;
                     break;
                 }
+                Some(AgentCmd::Interrupt { reply }) => {
+                    let _ = reply.send(Ok(()));
+                }
             }
         }
     });
 
     Ok(Arc::new(AgentSession { tx }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn interrupt_request_waits_for_runtime_acknowledgement() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let session = AgentSession { tx };
+
+        let task = tokio::spawn(async move { session.interrupt().await });
+        match rx.recv().await {
+            Some(AgentCmd::Interrupt { reply }) => {
+                let _ = reply.send(Ok(()));
+            }
+            _ => panic!("expected interrupt command"),
+        }
+
+        assert!(task.await.unwrap().is_ok());
+    }
 }

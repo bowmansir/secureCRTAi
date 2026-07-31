@@ -15,16 +15,27 @@ interface ConfirmOptions {
   message?: string;
   danger?: boolean;
   okText?: string;
+  hideCancel?: boolean;
 }
+
+interface ApprovalOptions {
+  title: string;
+  command: string;
+  reason?: string;
+}
+
+export type ApprovalChoice = "execute" | "modify" | "reject";
 
 interface DialogApi {
   prompt: (opts: PromptOptions) => Promise<string | null>;
   confirm: (opts: ConfirmOptions) => Promise<boolean>;
+  approval: (opts: ApprovalOptions) => Promise<ApprovalChoice>;
 }
 
 const Ctx = createContext<DialogApi>({
   prompt: async () => null,
   confirm: async () => false,
+  approval: async () => "reject",
 });
 
 export function useDialogs() {
@@ -33,7 +44,12 @@ export function useDialogs() {
 
 type Pending =
   | { kind: "prompt"; opts: PromptOptions; resolve: (v: string | null) => void }
-  | { kind: "confirm"; opts: ConfirmOptions; resolve: (v: boolean) => void };
+  | { kind: "confirm"; opts: ConfirmOptions; resolve: (v: boolean) => void }
+  | {
+      kind: "approval";
+      opts: ApprovalOptions;
+      resolve: (v: ApprovalChoice) => void;
+    };
 
 export function DialogProvider({ children }: { children: ReactNode }) {
   const [pending, setPending] = useState<Pending | null>(null);
@@ -53,6 +69,12 @@ export function DialogProvider({ children }: { children: ReactNode }) {
     });
   }, []);
 
+  const approval = useCallback((opts: ApprovalOptions) => {
+    return new Promise<ApprovalChoice>((resolve) => {
+      setPending({ kind: "approval", opts, resolve });
+    });
+  }, []);
+
   useEffect(() => {
     if (pending?.kind === "prompt") {
       // 等弹窗渲染后聚焦
@@ -60,16 +82,27 @@ export function DialogProvider({ children }: { children: ReactNode }) {
     }
   }, [pending]);
 
-  const close = (ok: boolean) => {
+  const close = (result: boolean | ApprovalChoice) => {
     if (!pending) return;
-    if (pending.kind === "prompt") pending.resolve(ok ? value : null);
-    else pending.resolve(ok);
+    if (pending.kind === "prompt") {
+      pending.resolve(result === true ? value : null);
+    } else if (pending.kind === "confirm") {
+      pending.resolve(result === true);
+    } else {
+      pending.resolve(
+        typeof result === "string"
+          ? result
+          : result
+            ? "execute"
+            : "reject"
+      );
+    }
     setPending(null);
     setValue("");
   };
 
   return (
-    <Ctx.Provider value={{ prompt, confirm }}>
+    <Ctx.Provider value={{ prompt, confirm, approval }}>
       {children}
       {pending && (
         <div className="modal-mask dialog-mask" onMouseDown={(e) => e.target === e.currentTarget && close(false)}>
@@ -80,7 +113,7 @@ export function DialogProvider({ children }: { children: ReactNode }) {
               if (e.key === "Escape") close(false);
             }}
           >
-            <h3>{pending.kind === "prompt" ? pending.opts.title : pending.opts.title}</h3>
+            <h3>{pending.opts.title}</h3>
             {pending.kind === "prompt" ? (
               <>
                 <input
@@ -93,20 +126,53 @@ export function DialogProvider({ children }: { children: ReactNode }) {
                 />
                 {pending.opts.note && <div className="form-note">{pending.opts.note}</div>}
               </>
-            ) : (
+            ) : pending.kind === "confirm" ? (
               pending.opts.message && <div className="dialog-message">{pending.opts.message}</div>
+            ) : (
+              <div className="dialog-message agent-approval-dialog">
+                <span>Agent 请求执行高风险命令</span>
+                <code>{pending.opts.command}</code>
+                {pending.opts.reason && <span>风险：{pending.opts.reason}</span>}
+              </div>
             )}
             <div className="modal-footer">
-              <button className="btn" onClick={() => close(false)}>
-                取消
-              </button>
-              <button
-                className={`btn ${pending.kind === "confirm" && pending.opts.danger ? "danger-btn" : "primary"}`}
-                onClick={() => close(true)}
-                autoFocus={pending.kind === "confirm"}
-              >
-                {pending.kind === "confirm" ? pending.opts.okText ?? "确定" : "确定"}
-              </button>
+              {pending.kind === "approval" ? (
+                <>
+                  <button className="btn" onClick={() => close("reject")}>
+                    拒绝
+                  </button>
+                  <button className="btn" onClick={() => close("modify")}>
+                    修改
+                  </button>
+                  <button
+                    className="btn danger-btn"
+                    onClick={() => close("execute")}
+                  >
+                    执行
+                  </button>
+                </>
+              ) : (
+                <>
+                  {!(pending.kind === "confirm" && pending.opts.hideCancel) && (
+                    <button className="btn" onClick={() => close(false)}>
+                      取消
+                    </button>
+                  )}
+                  <button
+                    className={`btn ${
+                      pending.kind === "confirm" && pending.opts.danger
+                        ? "danger-btn"
+                        : "primary"
+                    }`}
+                    onClick={() => close(true)}
+                    autoFocus={pending.kind === "confirm"}
+                  >
+                    {pending.kind === "confirm"
+                      ? pending.opts.okText ?? "确定"
+                      : "确定"}
+                  </button>
+                </>
+              )}
             </div>
           </div>
         </div>

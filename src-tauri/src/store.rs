@@ -49,6 +49,23 @@ pub struct Snippet {
     pub command: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ThemePreferences {
+    pub color_theme: String,
+    #[serde(default)]
+    pub background_theme_id: Option<String>,
+}
+
+impl Default for ThemePreferences {
+    fn default() -> Self {
+        Self {
+            color_theme: "dark".to_string(),
+            background_theme_id: None,
+        }
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct StoreFile {
@@ -62,6 +79,8 @@ struct StoreFile {
     ai_providers: Vec<AiProviderConfig>,
     #[serde(default)]
     active_provider: Option<String>,
+    #[serde(default)]
+    theme_preferences: Option<ThemePreferences>,
 }
 
 // ---------- 存储实现 ----------
@@ -255,6 +274,46 @@ impl Store {
         let id = data.active_provider.clone()?;
         data.ai_providers.iter().find(|p| p.id == id).cloned()
     }
+
+    // ----- 主题偏好 -----
+
+    pub fn theme_preferences(&self) -> Option<ThemePreferences> {
+        self.data.lock().theme_preferences.clone()
+    }
+
+    pub fn set_color_theme(&self, color_theme: &str) -> anyhow::Result<ThemePreferences> {
+        if !matches!(color_theme, "dark" | "midnight" | "light") {
+            anyhow::bail!("未知的颜色主题");
+        }
+        let mut data = self.data.lock();
+        let preferences = data
+            .theme_preferences
+            .get_or_insert_with(ThemePreferences::default);
+        preferences.color_theme = color_theme.to_string();
+        let result = preferences.clone();
+        self.persist(&data)?;
+        Ok(result)
+    }
+
+    pub fn set_background_theme(
+        &self,
+        background_theme_id: Option<String>,
+    ) -> anyhow::Result<ThemePreferences> {
+        if background_theme_id
+            .as_deref()
+            .is_some_and(|theme_id| theme_id.trim().is_empty() || theme_id.len() > 256)
+        {
+            anyhow::bail!("图片主题 ID 无效");
+        }
+        let mut data = self.data.lock();
+        let preferences = data
+            .theme_preferences
+            .get_or_insert_with(ThemePreferences::default);
+        preferences.background_theme_id = background_theme_id;
+        let result = preferences.clone();
+        self.persist(&data)?;
+        Ok(result)
+    }
 }
 
 /// 把会话中的加密密码解出来（仅在建立连接的瞬间使用，不回传前端）。
@@ -262,5 +321,73 @@ pub fn decrypt_optional(enc: &Option<String>) -> anyhow::Result<Option<String>> 
     match enc {
         Some(e) if !e.is_empty() => Ok(Some(vault::decrypt(e)?)),
         _ => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Store, StoreFile};
+    use parking_lot::Mutex;
+    use std::path::PathBuf;
+    use uuid::Uuid;
+
+    fn test_store() -> (Store, PathBuf) {
+        let path = std::env::temp_dir().join(format!("termai-store-{}.json", Uuid::new_v4()));
+        (
+            Store {
+                path: path.clone(),
+                data: Mutex::new(StoreFile::default()),
+            },
+            path,
+        )
+    }
+
+    #[test]
+    fn theme_preferences_are_written_to_and_restored_from_the_config_file() {
+        let (store, path) = test_store();
+        store.set_color_theme("midnight").unwrap();
+        store
+            .set_background_theme(Some("published-theme".to_string()))
+            .unwrap();
+
+        let saved: StoreFile =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let restored = Store {
+            path: path.clone(),
+            data: Mutex::new(saved),
+        };
+        let preferences = restored.theme_preferences().unwrap();
+        assert_eq!(preferences.color_theme, "midnight");
+        assert_eq!(
+            preferences.background_theme_id.as_deref(),
+            Some("published-theme")
+        );
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn theme_preference_updates_preserve_the_other_selection() {
+        let (store, path) = test_store();
+        store
+            .set_background_theme(Some("dark-art".to_string()))
+            .unwrap();
+        let preferences = store.set_color_theme("light").unwrap();
+        assert_eq!(preferences.color_theme, "light");
+        assert_eq!(preferences.background_theme_id.as_deref(), Some("dark-art"));
+
+        let preferences = store.set_background_theme(None).unwrap();
+        assert_eq!(preferences.color_theme, "light");
+        assert_eq!(preferences.background_theme_id, None);
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn invalid_theme_preferences_are_rejected_without_creating_a_config_file() {
+        let (store, path) = test_store();
+        assert!(store.set_color_theme("unknown").is_err());
+        assert!(store.set_background_theme(Some(String::new())).is_err());
+        assert!(!path.exists());
     }
 }

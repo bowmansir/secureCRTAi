@@ -4,11 +4,16 @@ import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 import * as api from "../api";
 import type { FileEntry, TabInfo } from "../types";
+import {
+  getTerminalTheme,
+  type AppTheme,
+} from "../terminal/terminalThemes";
 
 interface Props {
   tab: TabInfo;
   active: boolean;
   theme: AppTheme;
+  backgroundActive: boolean;
   onStatus: (tabId: string, status: TabInfo["status"]) => void;
   startTransfer: (
     sftpId: string,
@@ -19,14 +24,6 @@ interface Props {
     onDone?: () => void
   ) => void;
 }
-
-type AppTheme = "dark" | "midnight" | "light";
-
-const TERM_THEMES = {
-  dark: { background: "#0d1117", foreground: "#e6edf3", cursor: "#58a6ff", selectionBackground: "#264f78" },
-  midnight: { background: "#060a10", foreground: "#dbe7f7", cursor: "#7aa7ff", selectionBackground: "#20365a" },
-  light: { background: "#fbfdff", foreground: "#172033", cursor: "#245dce", selectionBackground: "#c8dcff" },
-};
 
 const PROMPT = "\x1b[95msftp>\x1b[0m ";
 const COMMANDS = ["ls", "ll", "cd", "pwd", "lls", "lcd", "lpwd", "get", "put", "mkdir", "rm", "rmdir", "mv", "rename", "clear", "help"];
@@ -186,7 +183,14 @@ function sortEntries(entries: FileEntry[]): FileEntry[] {
 }
 
 /** 类 SecureCRT 的 sftp> 交互式命令行，get/put 走传输队列 */
-export default function SftpCliView({ tab, active, theme, onStatus, startTransfer }: Props) {
+export default function SftpCliView({
+  tab,
+  active,
+  theme,
+  backgroundActive,
+  onStatus,
+  startTransfer,
+}: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
@@ -199,8 +203,9 @@ export default function SftpCliView({ tab, active, theme, onStatus, startTransfe
     const term = new Terminal({
       fontFamily: '"Cascadia Mono", Consolas, monospace',
       fontSize: 14,
-      theme: TERM_THEMES[theme],
+      theme: getTerminalTheme(theme, backgroundActive),
       cursorBlink: true,
+      allowTransparency: true,
       scrollback: 5000,
     });
     const fit = new FitAddon();
@@ -465,8 +470,10 @@ export default function SftpCliView({ tab, active, theme, onStatus, startTransfe
   }, [active]);
 
   useEffect(() => {
-    if (termRef.current) termRef.current.options.theme = TERM_THEMES[theme];
-  }, [theme]);
+    if (termRef.current) {
+      termRef.current.options.theme = getTerminalTheme(theme, backgroundActive);
+    }
+  }, [backgroundActive, theme]);
 
   return (
     <div

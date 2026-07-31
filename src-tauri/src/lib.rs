@@ -9,6 +9,7 @@ mod sftp;
 mod sftp_cli;
 mod store;
 mod terminal;
+mod themes;
 mod transfer;
 mod vault;
 
@@ -17,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use store::{AiProviderConfig, SessionProfile, Store};
+use store::{AiProviderConfig, SessionProfile, Store, ThemePreferences};
 use tauri::ipc::Channel;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -25,9 +26,73 @@ use tauri::{Manager, State};
 use terminal::ssh::SshParams;
 use terminal::{TermEvent, TerminalRegistry};
 use tokio::net::TcpStream;
-use tokio::sync::Semaphore;
+use tokio::sync::{oneshot, Semaphore};
 use tokio::time::timeout;
 use uuid::Uuid;
+
+const AI_PRE_CANCEL_TTL: Duration = Duration::from_secs(120);
+const AI_PRE_CANCEL_LIMIT: usize = 256;
+
+#[derive(Default)]
+struct AiRequestRegistryState {
+    requests: HashMap<String, oneshot::Sender<()>>,
+    pre_cancelled: HashMap<String, Instant>,
+}
+
+#[derive(Default)]
+struct AiRequestRegistry {
+    inner: parking_lot::Mutex<AiRequestRegistryState>,
+}
+
+impl AiRequestRegistry {
+    fn prune_pre_cancelled(state: &mut AiRequestRegistryState, now: Instant) {
+        state
+            .pre_cancelled
+            .retain(|_, created_at| now.duration_since(*created_at) <= AI_PRE_CANCEL_TTL);
+        while state.pre_cancelled.len() >= AI_PRE_CANCEL_LIMIT {
+            let Some(oldest) = state
+                .pre_cancelled
+                .iter()
+                .min_by_key(|(_, created_at)| **created_at)
+                .map(|(request_id, _)| request_id.clone())
+            else {
+                break;
+            };
+            state.pre_cancelled.remove(&oldest);
+        }
+    }
+
+    fn register(&self, request_id: String) -> oneshot::Receiver<()> {
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+        let mut state = self.inner.lock();
+        Self::prune_pre_cancelled(&mut state, Instant::now());
+        if state.pre_cancelled.remove(&request_id).is_some() {
+            let _ = cancel_tx.send(());
+            return cancel_rx;
+        }
+        if let Some(previous) = state.requests.insert(request_id, cancel_tx) {
+            let _ = previous.send(());
+        }
+        cancel_rx
+    }
+
+    fn cancel(&self, request_id: &str) -> bool {
+        let mut state = self.inner.lock();
+        if let Some(cancel_tx) = state.requests.remove(request_id) {
+            return cancel_tx.send(()).is_ok();
+        }
+        let now = Instant::now();
+        Self::prune_pre_cancelled(&mut state, now);
+        state.pre_cancelled.insert(request_id.to_string(), now);
+        true
+    }
+
+    fn finish(&self, request_id: &str) {
+        let mut state = self.inner.lock();
+        state.requests.remove(request_id);
+        state.pre_cancelled.remove(request_id);
+    }
+}
 
 struct AppState {
     terminals: TerminalRegistry,
@@ -35,6 +100,7 @@ struct AppState {
     transfers: transfer::TransferManager,
     agents: agent::AgentRegistry,
     forwards: forward::ForwardRegistry,
+    ai_requests: AiRequestRegistry,
     hostkeys: std::sync::Arc<hostkeys::HostKeyStore>,
     store: Store,
 }
@@ -213,6 +279,31 @@ mod tests {
         assert_eq!(result.latency_ms, None);
         assert_eq!(result.message, "session not found");
     }
+
+    #[tokio::test]
+    async fn ai_request_cancel_before_register_is_not_lost() {
+        let registry = AiRequestRegistry::default();
+
+        assert!(registry.cancel("request-before-register"));
+        let cancel_rx = registry.register("request-before-register".to_string());
+
+        tokio::time::timeout(Duration::from_millis(100), cancel_rx)
+            .await
+            .expect("pre-cancelled request should resolve immediately")
+            .expect("cancel sender should notify receiver");
+    }
+
+    #[tokio::test]
+    async fn ai_request_cancel_after_register_notifies_active_request() {
+        let registry = AiRequestRegistry::default();
+        let cancel_rx = registry.register("active-request".to_string());
+
+        assert!(registry.cancel("active-request"));
+        tokio::time::timeout(Duration::from_millis(100), cancel_rx)
+            .await
+            .expect("active request should be cancelled")
+            .expect("cancel sender should notify receiver");
+    }
 }
 
 fn err_str(e: anyhow::Error) -> String {
@@ -302,6 +393,12 @@ async fn agent_run(
 }
 
 #[tauri::command]
+async fn agent_interrupt(state: State<'_, AppState>, id: String) -> CmdResult<()> {
+    let session = state.agents.get(&id).ok_or("Agent 会话不存在")?;
+    session.interrupt().await.map_err(err_str)
+}
+
+#[tauri::command]
 fn agent_close(state: State<'_, AppState>, id: String) -> CmdResult<()> {
     if let Some(s) = state.agents.remove(&id) {
         s.close();
@@ -367,6 +464,26 @@ async fn sftp_list(
 ) -> CmdResult<Vec<sftp::FileEntry>> {
     let conn = state.sftp.get(&id).ok_or("SFTP 连接不存在")?;
     sftp::list_dir(&conn, &path).await.map_err(err_str)
+}
+
+#[tauri::command]
+async fn sftp_read_text(
+    state: State<'_, AppState>,
+    id: String,
+    remote: String,
+    max_bytes: usize,
+) -> CmdResult<String> {
+    const MIN_CONTEXT_FILE_BYTES: usize = 1024;
+    const MAX_CONTEXT_FILE_BYTES: usize = 65_536;
+
+    let conn = state.sftp.get(&id).ok_or("SFTP 连接不存在")?;
+    sftp::read_text_preview(
+        &conn,
+        &remote,
+        max_bytes.clamp(MIN_CONTEXT_FILE_BYTES, MAX_CONTEXT_FILE_BYTES),
+    )
+    .await
+    .map_err(err_str)
 }
 
 #[tauri::command]
@@ -957,6 +1074,49 @@ fn session_set_group(state: State<'_, AppState>, id: String, group: String) -> C
         .map_err(err_str)
 }
 
+// ---------- 主题偏好 ----------
+
+#[tauri::command]
+fn theme_get_preferences(state: State<'_, AppState>) -> CmdResult<Option<ThemePreferences>> {
+    let Some(mut preferences) = state.store.theme_preferences() else {
+        return Ok(None);
+    };
+    if !matches!(
+        preferences.color_theme.as_str(),
+        "dark" | "midnight" | "light"
+    ) {
+        preferences = state
+            .store
+            .set_color_theme("dark")
+            .map_err(err_str)?;
+    }
+    if preferences
+        .background_theme_id
+        .as_deref()
+        .is_some_and(|theme_id| theme_id.trim().is_empty() || theme_id.len() > 256)
+    {
+        preferences = state.store.set_background_theme(None).map_err(err_str)?;
+    }
+    Ok(Some(preferences))
+}
+
+#[tauri::command]
+fn theme_set_color(state: State<'_, AppState>, color_theme: String) -> CmdResult<ThemePreferences> {
+    state
+        .store
+        .set_color_theme(color_theme.trim())
+        .map_err(err_str)
+}
+
+#[tauri::command]
+fn theme_set_background(
+    state: State<'_, AppState>,
+    theme_id: Option<String>,
+) -> CmdResult<ThemePreferences> {
+    let theme_id = theme_id.map(|value| value.trim().to_string());
+    state.store.set_background_theme(theme_id).map_err(err_str)
+}
+
 // ---------- AI ----------
 
 /// 回传前端的 Provider 视图：不含密文，只标记是否已配置 Key
@@ -1056,6 +1216,7 @@ fn ai_set_active(state: State<'_, AppState>, id: String) -> CmdResult<()> {
 #[tauri::command]
 async fn ai_chat(
     state: State<'_, AppState>,
+    request_id: String,
     system: Option<String>,
     messages: Vec<ChatMessage>,
     on_event: Channel<AiEvent>,
@@ -1064,9 +1225,18 @@ async fn ai_chat(
         .store
         .active_provider()
         .ok_or("尚未配置 AI Provider，请先到设置页添加")?;
-    // 放到后台任务执行，命令立即返回，增量经 Channel 推送
-    tauri::async_runtime::spawn(ai::chat_stream(cfg, system, messages, on_event));
+    let cancel_rx = state.ai_requests.register(request_id.clone());
+    tokio::select! {
+        _ = ai::chat_stream(cfg, system, messages, on_event) => {}
+        _ = cancel_rx => {}
+    }
+    state.ai_requests.finish(&request_id);
     Ok(())
+}
+
+#[tauri::command]
+fn ai_cancel(state: State<'_, AppState>, request_id: String) -> bool {
+    state.ai_requests.cancel(&request_id)
 }
 
 // ---------- 入口 ----------
@@ -1126,6 +1296,14 @@ pub fn run() {
         })
         .setup(|app| {
             setup_system_tray(app)?;
+            show_main_window(app.handle());
+            // Windows 下 WebView 原生窗口在 setup 返回后才完全可见。延迟到事件循环
+            // 启动后再显示一次，避免开发版启动成功却只留下托盘图标。
+            let app_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                show_main_window(&app_handle);
+            });
             Ok(())
         })
         .manage(AppState {
@@ -1134,6 +1312,7 @@ pub fn run() {
             transfers: transfer::TransferManager::default(),
             agents: agent::AgentRegistry::default(),
             forwards: forward::ForwardRegistry::default(),
+            ai_requests: AiRequestRegistry::default(),
             hostkeys: std::sync::Arc::new(hostkeys::HostKeyStore::load()),
             store,
         })
@@ -1144,12 +1323,14 @@ pub fn run() {
             ssh_probe_env,
             agent_open,
             agent_run,
+            agent_interrupt,
             agent_close,
             term_write,
             term_resize,
             term_close,
             sftp_open,
             sftp_list,
+            sftp_read_text,
             sftp_download,
             sftp_upload,
             sftp_mkdir,
@@ -1197,6 +1378,13 @@ pub fn run() {
             ai_delete_provider,
             ai_set_active,
             ai_chat,
+            ai_cancel,
+            themes::theme_list,
+            themes::theme_load_asset,
+            themes::theme_open_folder,
+            theme_get_preferences,
+            theme_set_color,
+            theme_set_background,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

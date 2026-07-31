@@ -81,6 +81,7 @@ pub fn open(
                     if events
                         .send(TermEvent::Data {
                             bytes: buf[..n].to_vec(),
+                            command_id: None,
                         })
                         .is_err()
                     {

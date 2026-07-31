@@ -1,3 +1,4 @@
+pub mod integration;
 pub mod local;
 pub mod ssh;
 
@@ -8,11 +9,34 @@ use std::sync::Arc;
 
 /// 推送给前端某个终端标签页的事件流。
 #[derive(Clone, Serialize)]
-#[serde(tag = "type", rename_all = "camelCase")]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum TermEvent {
-    Data { bytes: Vec<u8> },
+    Data {
+        bytes: Vec<u8>,
+        command_id: Option<String>,
+    },
     Connected,
-    Exit { message: Option<String> },
+    ShellIntegration {
+        available: bool,
+        shell: Option<String>,
+    },
+    ShellCommand {
+        command_id: String,
+        command: String,
+    },
+    ShellPrompt {
+        command_id: Option<String>,
+        cwd: String,
+        exit_code: i32,
+        command: Option<String>,
+    },
+    Exit {
+        message: Option<String>,
+    },
 }
 
 /// 终端会话的统一控制句柄，本地 PTY 与 SSH 各自实现。
