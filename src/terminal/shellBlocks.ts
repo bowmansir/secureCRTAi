@@ -75,9 +75,15 @@ export function stripTerminalControlSequences(value: string): string {
   return applyBackspaces(withoutControls);
 }
 
-export function isInteractiveShellCommand(command: string): boolean {
+type ShellInvocation = {
+  executable: string;
+  args: string[];
+  usesSudo: boolean;
+};
+
+function parseShellInvocation(command: string): ShellInvocation | null {
   const tokens = command.trim().split(/\s+/).filter(Boolean);
-  if (tokens.length === 0) return false;
+  if (tokens.length === 0) return null;
 
   let commandIndex = 0;
   let usesSudo = false;
@@ -119,7 +125,74 @@ export function isInteractiveShellCommand(command: string): boolean {
 
   const executable = basename(tokens[commandIndex] ?? "").toLowerCase();
   const args = tokens.slice(commandIndex + 1);
+  return { executable, args, usesSudo };
+}
+
+function isStreamingShellInvocation(
+  executable: string,
+  args: string[]
+): boolean {
+  if (executable === "watch") return true;
+  if (executable === "pm2") {
+    const operation = args[0]?.toLowerCase();
+    return (
+      (operation === "log" || operation === "logs") &&
+      !args.includes("--nostream")
+    );
+  }
+  if (executable === "tail") {
+    return args.some(
+      (arg) =>
+        arg === "--follow" ||
+        arg.startsWith("--follow=") ||
+        /^-[^-]*[fF]/.test(arg)
+    );
+  }
+  if (executable === "journalctl") {
+    return args.some(
+      (arg) =>
+        arg === "--follow" ||
+        arg.startsWith("--follow=") ||
+        /^-[^-]*f/.test(arg)
+    );
+  }
+  if (executable === "docker" || executable === "podman") {
+    const logsIndex = args.findIndex((arg) => arg === "logs");
+    return (
+      logsIndex >= 0 &&
+      args
+        .slice(logsIndex + 1)
+        .some(
+          (arg) =>
+            arg === "--follow" ||
+            arg.startsWith("--follow=") ||
+            /^-[^-]*f/.test(arg)
+        )
+    );
+  }
+  if (executable === "kubectl") {
+    const logsIndex = args.findIndex((arg) => arg === "logs");
+    return (
+      logsIndex >= 0 &&
+      args
+        .slice(logsIndex + 1)
+        .some(
+          (arg) =>
+            arg === "--follow" ||
+            arg.startsWith("--follow=") ||
+            /^-[^-]*f/.test(arg)
+        )
+    );
+  }
+  return false;
+}
+
+export function isInteractiveShellCommand(command: string): boolean {
+  const invocation = parseShellInvocation(command);
+  if (!invocation) return false;
+  const { executable, args, usesSudo } = invocation;
   if (usesSudo) return true;
+  if (isStreamingShellInvocation(executable, args)) return true;
   if (
     [
       "vi",
@@ -158,10 +231,30 @@ export function isInteractiveShellCommand(command: string): boolean {
     return args.every((arg) => arg.startsWith("-"));
   }
   if (executable === "php") return args.length === 0 || args.includes("-a");
-  if (executable === "psql") return !args.includes("-c") && !args.includes("--command");
-  if (executable === "mysql") return !args.includes("-e") && !args.includes("--execute");
+  if (executable === "psql")
+    return !args.includes("-c") && !args.includes("--command");
+  if (executable === "mysql")
+    return !args.includes("-e") && !args.includes("--execute");
   if (executable === "redis-cli") return args.length === 0;
   return false;
+}
+
+export function getRunningShellCommandLabel(command: string): string {
+  const sleep = command
+    .trim()
+    .match(/^sleep\s+([0-9]+(?:\.[0-9]+)?)([smhd]?)$/i);
+  if (sleep) {
+    const unit =
+      {
+        "": "秒",
+        s: "秒",
+        m: "分钟",
+        h: "小时",
+        d: "天",
+      }[sleep[2].toLowerCase()] ?? "";
+    return `等待 ${sleep[1]} ${unit}`.trim();
+  }
+  return isInteractiveShellCommand(command) ? "持续运行" : "命令运行中";
 }
 
 function basename(value: string): string {

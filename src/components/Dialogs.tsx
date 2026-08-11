@@ -1,5 +1,6 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
+import { shouldDismissDialogFromBackdrop } from "./dialogBehavior";
 
 interface PromptOptions {
   title: string;
@@ -21,6 +22,7 @@ interface ConfirmOptions {
 interface ApprovalOptions {
   title: string;
   command: string;
+  riskLevel?: "unknown" | "moderate" | "high";
   reason?: string;
 }
 
@@ -105,7 +107,14 @@ export function DialogProvider({ children }: { children: ReactNode }) {
     <Ctx.Provider value={{ prompt, confirm, approval }}>
       {children}
       {pending && (
-        <div className="modal-mask dialog-mask" onMouseDown={(e) => e.target === e.currentTarget && close(false)}>
+        <div
+          className="modal-mask dialog-mask"
+          onMouseDown={(e) =>
+            e.target === e.currentTarget &&
+            shouldDismissDialogFromBackdrop(pending.kind) &&
+            close(false)
+          }
+        >
           <div
             className="modal dialog"
             onKeyDown={(e) => {
@@ -130,9 +139,20 @@ export function DialogProvider({ children }: { children: ReactNode }) {
               pending.opts.message && <div className="dialog-message">{pending.opts.message}</div>
             ) : (
               <div className="dialog-message agent-approval-dialog">
-                <span>Agent 请求执行高风险命令</span>
+                <span>
+                  {pending.opts.riskLevel === "high"
+                    ? "Agent 请求执行高风险命令"
+                    : pending.opts.riskLevel === "moderate"
+                      ? "Agent 请求执行中风险命令"
+                      : "Agent 请求执行需确认命令"}
+                </span>
                 <code>{pending.opts.command}</code>
-                {pending.opts.reason && <span>风险：{pending.opts.reason}</span>}
+                {pending.opts.reason && (
+                  <span>
+                    {pending.opts.riskLevel === "unknown" ? "确认原因" : "风险"}：
+                    {pending.opts.reason}
+                  </span>
+                )}
               </div>
             )}
             <div className="modal-footer">
@@ -145,7 +165,9 @@ export function DialogProvider({ children }: { children: ReactNode }) {
                     修改
                   </button>
                   <button
-                    className="btn danger-btn"
+                    className={`btn ${
+                      pending.opts.riskLevel === "high" ? "danger-btn" : "primary"
+                    }`}
                     onClick={() => close("execute")}
                   >
                     执行

@@ -7,6 +7,7 @@ import {
   appendShellBlockOutput,
   completeShellBlock,
   createShellBlock,
+  getRunningShellCommandLabel,
   isInteractiveShellCommand,
   stripTerminalControlSequences,
 } from "../src/terminal/shellBlocks.ts";
@@ -168,6 +169,14 @@ test("detects raw terminal commands without treating scripts as REPLs", () => {
     "bash",
     "zsh -l",
     "pwsh -NoExit",
+    "pm2 log 0",
+    "pm2 logs --lines 100",
+    "tail -f /var/log/messages",
+    "journalctl -fu nginx",
+    "docker logs -f nginx",
+    "podman logs --follow nginx",
+    "kubectl logs -f deployment/api",
+    "watch -n 2 uptime",
   ]) {
     assert.equal(isInteractiveShellCommand(command), true, command);
   }
@@ -180,7 +189,19 @@ test("detects raw terminal commands without treating scripts as REPLs", () => {
     "bash deploy.sh",
     "bash -c 'echo ok'",
     "pwsh -File deploy.ps1",
+    "sleep 3",
+    "timeout 8s tail -f /var/log/messages",
+    "pm2 logs 0 --lines 100 --nostream",
+    "journalctl -u nginx -n 100",
+    "docker logs --tail 100 nginx",
   ]) {
     assert.equal(isInteractiveShellCommand(command), false, command);
   }
+});
+
+test("describes finite waits separately from persistent foreground commands", () => {
+  assert.equal(getRunningShellCommandLabel("sleep 3"), "等待 3 秒");
+  assert.equal(getRunningShellCommandLabel("sleep 1.5m"), "等待 1.5 分钟");
+  assert.equal(getRunningShellCommandLabel("pm2 logs 0"), "持续运行");
+  assert.equal(getRunningShellCommandLabel("make build"), "命令运行中");
 });

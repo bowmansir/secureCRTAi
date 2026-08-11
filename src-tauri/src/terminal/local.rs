@@ -117,7 +117,7 @@ fn default_shell() -> String {
 fn configure_terminal_env(cmd: &mut CommandBuilder) {
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
-    cmd.env("TERM_PROGRAM", "TermAI");
+    cmd.env("TERM_PROGRAM", "Termexa");
     cmd.env("CLICOLOR", "1");
 }
 
@@ -143,7 +143,7 @@ mod tests {
         );
         assert_eq!(
             cmd.get_env("TERM_PROGRAM").and_then(|v| v.to_str()),
-            Some("TermAI")
+            Some("Termexa")
         );
     }
 }

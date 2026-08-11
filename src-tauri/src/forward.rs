@@ -729,7 +729,7 @@ mod tests {
     use tokio::task::JoinHandle;
     use tokio::time::timeout;
 
-    const TEST_PAYLOAD: &[u8] = b"termai-forward-e2e-payload\nsecond-line";
+    const TEST_PAYLOAD: &[u8] = b"termexa-forward-e2e-payload\nsecond-line";
 
     #[derive(Clone)]
     struct TestForwardSshServer {

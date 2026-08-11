@@ -26,6 +26,14 @@ export interface TerminalSubmissionData {
   submit: "\r" | "\n" | "\r\n";
 }
 
+export interface TerminalSubmissionRouteContext {
+  submittedText: string;
+  inputStartedAtPrompt: boolean;
+  captureReliable: boolean;
+  recoveredFromTerminal: boolean;
+  decision: TerminalInputDecision;
+}
+
 const KNOWN_SHELL_COMMANDS = new Set([
   "alias",
   "apt",
@@ -214,6 +222,20 @@ export function classifyTerminalInput(
   if (hasShellSyntax(trimmed)) return shellDecision("shell-syntax");
   if (!/\s/.test(trimmed)) return shellDecision("single-token", 0.9);
   return shellDecision("safe-fallback", 0.6);
+}
+
+export function canRouteTerminalSubmission(
+  context: TerminalSubmissionRouteContext
+): boolean {
+  if (!context.submittedText.trim()) return false;
+  if (context.recoveredFromTerminal) return true;
+  if (!context.inputStartedAtPrompt) return false;
+  if (context.captureReliable) return true;
+  return (
+    context.decision.target === "agent" &&
+    (context.decision.reason === "natural-language" ||
+      context.decision.reason === "manual-agent")
+  );
 }
 
 export function stripTerminalControlSequences(value: string): string {

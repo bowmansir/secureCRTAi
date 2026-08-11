@@ -17,6 +17,7 @@ import Icon from "./Icons";
 import InlineAgentTimeline from "./InlineAgentTimeline";
 import type { SessionProfile, TabInfo, TermEvent } from "../types";
 import {
+  canRouteTerminalSubmission,
   classifyTerminalInput,
   extractTerminalPromptInput,
   isLikelyShellPrompt,
@@ -26,8 +27,10 @@ import {
 } from "../terminal/inputRouter";
 import {
   decideTerminalInput,
+  getInputModeIndicator,
+  resolvePromptInputTarget,
   resolveInputTargetForDisplay,
-  shouldResetManualOverride,
+  toggleFixedInputMode,
 } from "../terminal/inputDecisionModel";
 import {
   createShellBlockAttachment,
@@ -39,6 +42,7 @@ import {
   appendShellBlockOutput,
   completeShellBlock,
   createShellBlock,
+  getRunningShellCommandLabel,
   isInteractiveShellCommand,
 } from "../terminal/shellBlocks";
 import type {
@@ -73,6 +77,8 @@ interface Props {
   onOpenSftp?: () => void;
   /** 把选中文本交给 AI 面板解释 */
   onAskAi: (question: string) => void;
+  /** 打开传统命令助手并聚焦输入框 */
+  onOpenCommandAssistant: () => void;
   /** 当前是否已配置可用的 AI Provider */
   agentAvailable: boolean;
   /** 顶部 AI 面板打开时隐藏终端内联 Agent 入口和时间线 */
@@ -130,6 +136,7 @@ export default function TerminalView({
   onSize,
   onOpenSftp,
   onAskAi,
+  onOpenCommandAssistant,
   agentAvailable,
   inlineAgentEnabled,
   sessionProfile,
@@ -206,6 +213,7 @@ export default function TerminalView({
         const choice = await dialogsRef.current.approval({
           title: "Agent 命令确认",
           command: action.command,
+          riskLevel: risk.riskLevel,
           reason: risk.reason,
         });
         if (choice !== "modify") return { decision: choice };
@@ -220,19 +228,24 @@ export default function TerminalView({
       },
     });
   }
-  const inputMode: TerminalInputMode = surface?.manualOverride ?? "auto";
+  const inputMode: TerminalInputMode = surface?.routingMode ?? "auto";
   const detectedTarget: TerminalInputTarget =
     surface?.inputTarget ?? "shell";
   inputModeRef.current = inputMode;
 
   const hasAgentConversation =
     surface?.blocks.some((block) => block.kind !== "shell") ?? false;
+  const runningShellBlock = surface?.blocks.find(
+    (block): block is ShellBlock =>
+      block.kind === "shell" && block.status === "running"
+  );
+  const shellBusy = Boolean(runningShellBlock);
   const inlineTimelineVisible =
     inlineAgentEnabled &&
     integrationState === "ready" &&
     surface?.control !== "raw-terminal" &&
     hasAgentConversation;
-  const composerActive = inlineTimelineVisible;
+  const composerActive = inlineTimelineVisible && !shellBusy;
   composerActiveRef.current = composerActive;
 
   const activeInputTarget = composerActive
@@ -240,17 +253,13 @@ export default function TerminalView({
         {
           text: composerDraft,
           agentAvailable,
-          manualOverride: inputMode === "auto" ? null : inputMode,
+          routingMode: inputMode,
           captureReliable: true,
           agentFollowUp: hasAgentConversation,
         },
         detectedTarget
       )
     : detectedTarget;
-  const shellBusy =
-    surface?.blocks.some(
-      (block) => block.kind === "shell" && block.status === "running"
-    ) ?? false;
   const agentActive =
     surface?.control === "streaming" ||
     surface?.control === "executing" ||
@@ -386,8 +395,7 @@ export default function TerminalView({
       text,
       agentAvailable:
         agentAvailableRef.current && integrationStateRef.current !== "raw",
-      manualOverride:
-        inputModeRef.current === "auto" ? null : inputModeRef.current,
+      routingMode: inputModeRef.current,
       captureReliable: true,
       agentFollowUp:
         surfaceRef.current?.blocks.some((block) => block.kind !== "shell") ??
@@ -398,7 +406,6 @@ export default function TerminalView({
     setComposerDraft("");
     dispatchToSurface(tab.tabId, { type: "set-draft", draft: "" });
     composerHistoryIndexRef.current = -1;
-    if (inputModeRef.current !== "auto") setInputMode("auto");
     dispatchToSurface(tab.tabId, {
       type: "set-input-target",
       target: submitDecision.target,
@@ -431,7 +438,6 @@ export default function TerminalView({
       await runtimeRef.current?.stop(tab.tabId);
       if (disposedRef.current) return;
     }
-    if (inputModeRef.current !== "auto") setInputMode("auto");
     composerDraftRef.current = "";
     setComposerDraft("");
     dispatchToSurface(tab.tabId, { type: "set-draft", draft: "" });
@@ -459,7 +465,7 @@ export default function TerminalView({
         text: inputText,
         agentAvailable:
           agentAvailableRef.current && integrationStateRef.current !== "raw",
-        manualOverride: mode === "auto" ? null : mode,
+        routingMode: mode,
         captureReliable: composerActiveRef.current
           ? true
           : inputCaptureRef.current.reliable,
@@ -470,8 +476,8 @@ export default function TerminalView({
       surfaceRef.current?.inputTarget ?? "shell"
     );
     dispatchToSurface(tab.tabId, {
-      type: "set-manual-override",
-      target: mode === "auto" ? null : mode,
+      type: "set-routing-mode",
+      mode,
     });
     dispatchToSurface(tab.tabId, { type: "set-input-target", target });
     if (composerActiveRef.current) {
@@ -482,14 +488,7 @@ export default function TerminalView({
   };
 
   const updateComposerDraft = (nextDraft: string) => {
-    const previousDraft = composerDraftRef.current;
     composerDraftRef.current = nextDraft;
-    if (
-      inputModeRef.current !== "auto" &&
-      shouldResetManualOverride(previousDraft, nextDraft)
-    ) {
-      setInputMode("auto");
-    }
     setComposerDraft(nextDraft);
   };
 
@@ -501,7 +500,10 @@ export default function TerminalView({
       } else {
         dispatchToSurface(tab.tabId, {
           type: "set-input-target",
-          target: "shell",
+          target: resolvePromptInputTarget(
+            inputModeRef.current,
+            agentAvailableRef.current
+          ),
         });
       }
     }
@@ -540,6 +542,20 @@ export default function TerminalView({
     }, delay);
     return () => window.clearTimeout(timer);
   }, [active, composerActive]);
+
+  useEffect(() => {
+    if (!isVisible || !shellBusy) return;
+    const interrupt = (event: KeyboardEvent) => {
+      if (!event.ctrlKey || event.shiftKey || event.altKey) return;
+      if (event.key.toLowerCase() !== "c") return;
+      event.preventDefault();
+      event.stopPropagation();
+      writeToPtyRef.current("\x03");
+      termRef.current?.focus();
+    };
+    window.addEventListener("keydown", interrupt, true);
+    return () => window.removeEventListener("keydown", interrupt, true);
+  }, [isVisible, shellBusy]);
 
   useEffect(() => {
     dispatchToSurface(tab.tabId, {
@@ -643,7 +659,7 @@ export default function TerminalView({
         shellIntegrationReadyRef.current = e.available;
         integrationStateRef.current = e.available ? "ready" : "raw";
         setIntegrationState(e.available ? "ready" : "raw");
-        if (!e.available && inputModeRef.current !== "auto") {
+        if (!e.available && inputModeRef.current === "agent") {
           setInputMode("auto");
         }
         const currentEnvironment = surfaceRef.current?.environment;
@@ -920,6 +936,18 @@ export default function TerminalView({
         return;
       }
 
+      if (inputModeRef.current === "shell") {
+        writeToPty(data);
+        if (
+          splitTerminalSubmissionData(data) ||
+          data.includes("\x03") ||
+          data.includes("\x15")
+        ) {
+          resetInputCapture(false);
+        }
+        return;
+      }
+
       const submission = splitTerminalSubmissionData(data);
       if (submission) {
         if (submission.input) {
@@ -955,15 +983,18 @@ export default function TerminalView({
         if (bufferedCommand) rawCommandFallbackRef.current = bufferedCommand;
         const submittedText = bufferedCommand || capture.text.trim();
         const recoveredFromTerminal = Boolean(bufferedCommand);
-        const canRoute =
-          Boolean(submittedText) &&
-          ((inputStartedAtPromptRef.current && capture.reliable) ||
-            recoveredFromTerminal);
         const decision = classifyTerminalInput(
           submittedText,
           inputModeRef.current,
           agentAvailableRef.current && integrationStateRef.current !== "raw"
         );
+        const canRoute = canRouteTerminalSubmission({
+          submittedText,
+          inputStartedAtPrompt: inputStartedAtPromptRef.current,
+          captureReliable: capture.reliable,
+          recoveredFromTerminal,
+          decision,
+        });
 
         if (
           inlineAgentEnabledRef.current &&
@@ -974,7 +1005,6 @@ export default function TerminalView({
           writeToPty("\x15");
           const prompt = submittedText;
           resetInputCapture(true);
-          if (inputModeRef.current !== "auto") setInputMode("auto");
           dispatchToSurface(tab.tabId, {
             type: "set-input-target",
             target: decision.target,
@@ -1017,7 +1047,6 @@ export default function TerminalView({
 
         writeToPty(data);
         resetInputCapture(false);
-        if (inputModeRef.current !== "auto") setInputMode("auto");
         dispatchToSurface(tab.tabId, {
           type: "set-input-target",
           target: decision.target,
@@ -1048,9 +1077,6 @@ export default function TerminalView({
 
       writeToPty(data);
       if (data.includes("\x03")) resetInputCapture(false);
-      if (data.includes("\x15") && inputModeRef.current !== "auto") {
-        setInputMode("auto");
-      }
     });
 
     const resizeSub = term.onResize(({ cols, rows }) => {
@@ -1092,8 +1118,28 @@ export default function TerminalView({
         return false;
       }
 
-      if ((ev.ctrlKey || ev.metaKey) && ev.shiftKey && key === "i") {
-        setInputMode(inputModeRef.current === "agent" ? "auto" : "agent");
+      if (
+        !rawTerminalRef.current &&
+        (ev.ctrlKey || ev.metaKey) &&
+        ev.shiftKey &&
+        key === "i"
+      ) {
+        setInputMode(
+          toggleFixedInputMode(
+            inputModeRef.current,
+            "agent",
+            agentAvailableRef.current
+          )
+        );
+        return false;
+      }
+      if (
+        !rawTerminalRef.current &&
+        (ev.ctrlKey || ev.metaKey) &&
+        ev.shiftKey &&
+        key === "y"
+      ) {
+        onOpenCommandAssistant();
         return false;
       }
 
@@ -1235,23 +1281,46 @@ export default function TerminalView({
           >
             {(["shell", "agent"] as TerminalInputTarget[]).map((mode) => {
               const label = mode === "shell" ? "Shell" : "Agent";
+              const indicator = getInputModeIndicator(
+                inputMode,
+                activeInputTarget,
+                mode
+              );
               return (
                 <button
                   key={mode}
                   type="button"
                   className={`terminal-mode-option${
-                    mode === activeInputTarget ? " active" : ""
+                    indicator !== "inactive" ? " active" : ""
+                  }${
+                    indicator === "automatic"
+                      ? " auto-active"
+                      : ""
+                  }${
+                    indicator === "fixed" ? " fixed-active" : ""
                   }`}
                   disabled={mode === "agent" && !agentAvailable}
                   title={
                     mode === "agent" && !agentAvailable
                       ? "Agent（请先配置 AI Provider）"
-                      : label
+                      : inputMode === mode
+                        ? `${label} 固定模式（再次点击恢复自动）${
+                            mode === "agent" ? " · Ctrl+Shift+I" : ""
+                          }`
+                        : `${label}${
+                            mode === "agent" ? " · Ctrl+Shift+I" : ""
+                          }（点击固定）`
                   }
                   aria-label={label}
                   aria-pressed={mode === activeInputTarget}
                   onClick={() =>
-                    setInputMode(inputMode === mode ? "auto" : mode)
+                    setInputMode(
+                      toggleFixedInputMode(
+                        inputMode,
+                        mode,
+                        mode !== "agent" || agentAvailable
+                      )
+                    )
                   }
                 >
                   <Icon
@@ -1419,7 +1488,22 @@ export default function TerminalView({
                       event.key.toLowerCase() === "i"
                     ) {
                       event.preventDefault();
-                      setInputMode(inputMode === "agent" ? "auto" : "agent");
+                      setInputMode(
+                        toggleFixedInputMode(
+                          inputMode,
+                          "agent",
+                          agentAvailable
+                        )
+                      );
+                      return;
+                    }
+                    if (
+                      (event.ctrlKey || event.metaKey) &&
+                      event.shiftKey &&
+                      event.key.toLowerCase() === "y"
+                    ) {
+                      event.preventDefault();
+                      onOpenCommandAssistant();
                       return;
                     }
                     if (
@@ -1453,15 +1537,28 @@ export default function TerminalView({
                     }
                   }}
                 />
-                {shellBusy && (
-                  <span className="terminal-native-input-status">
-                    等待命令结束
-                  </span>
-                )}
               </div>
             </div>
           )}
         </InlineAgentTimeline>
+      )}
+      {isVisible && runningShellBlock && (
+        <div className="terminal-command-running" role="status">
+          <span className="terminal-command-running-dot" aria-hidden="true" />
+          <span>{getRunningShellCommandLabel(runningShellBlock.command)}</span>
+          <span className="terminal-command-running-shortcut">Ctrl+C</span>
+          <button
+            type="button"
+            title="中断当前命令 (Ctrl+C)"
+            onClick={() => {
+              writeToPtyRef.current("\x03");
+              termRef.current?.focus();
+            }}
+          >
+            <Icon name="close" size={11} />
+            <span>中断</span>
+          </button>
+        </div>
       )}
       {isVisible && inlineAgentEnabled && integrationState !== "ready" && (
         <div className={`terminal-integration-status ${integrationState}`}>

@@ -181,7 +181,7 @@ test("a failed channel open is cleared so the next execution can retry", async (
     },
     async interrupt() {},
     async close() {},
-  });
+  }, { watchdogGraceMs: 50 });
 
   await assert.rejects(
     registry.execute(action("surface-a", "session-a", "uptime")),
@@ -195,7 +195,32 @@ test("a failed channel open is cleared so the next execution can retry", async (
   assert.equal(outcome.status, "completed");
 });
 
-test("execution timeout rejects without waiting for channel close to finish", async () => {
+test("backend cleanup can finish before the frontend watchdog takes over", async () => {
+  const calls = { close: [] as string[] };
+  const registry = new AgentChannelRegistry({
+    async open() {
+      return "channel-cleanup";
+    },
+    async run() {
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      return { output: "已由后端中断", exitCode: null };
+    },
+    async interrupt() {},
+    async close(channelId) {
+      calls.close.push(channelId);
+    },
+  }, { watchdogGraceMs: 20 });
+
+  const outcome = await registry.execute({
+    ...action("surface-a", "session-a", "uptime"),
+    timeoutMs: 20,
+  });
+
+  assert.equal(outcome.status, "completed");
+  assert.deepEqual(calls.close, []);
+});
+
+test("execution watchdog rejects without waiting indefinitely for cleanup", async () => {
   const never = new Promise<AgentCommandOutput>(() => {});
   const registry = new AgentChannelRegistry({
     async open() {
@@ -210,7 +235,7 @@ test("execution timeout rejects without waiting for channel close to finish", as
     async close() {
       await new Promise(() => {});
     },
-  });
+  }, { watchdogGraceMs: 20, interruptWaitMs: 20 });
 
   const started = Date.now();
   await assert.rejects(
@@ -218,7 +243,69 @@ test("execution timeout rejects without waiting for channel close to finish", as
       ...action("surface-a", "session-a", "uptime"),
       timeoutMs: 20,
     }),
-    /执行超时/
+    /响应超时/
   );
   assert.ok(Date.now() - started < 500);
+});
+
+test("closing a running channel still reaches close when interrupt hangs", async () => {
+  const slow = deferred<AgentCommandOutput>();
+  const calls = { close: [] as string[] };
+  const registry = new AgentChannelRegistry({
+    async open() {
+      return "channel-stuck-interrupt";
+    },
+    async run() {
+      return slow.promise;
+    },
+    async interrupt() {
+      await new Promise(() => {});
+    },
+    async close(channelId) {
+      calls.close.push(channelId);
+    },
+  }, { interruptWaitMs: 20 });
+
+  const running = registry
+    .execute(action("surface-a", "session-a", "uptime"))
+    .catch(() => undefined);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  await Promise.race([
+    registry.close("surface-a"),
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error("close remained blocked")), 500)
+    ),
+  ]);
+  slow.resolve({ output: "stopped", exitCode: null });
+  await running;
+
+  assert.deepEqual(calls.close, ["channel-stuck-interrupt"]);
+});
+
+test("a failed run invalidates the stale backend channel", async () => {
+  const calls = { open: 0, run: [] as string[] };
+  const registry = new AgentChannelRegistry({
+    async open() {
+      calls.open += 1;
+      return `channel-${calls.open}`;
+    },
+    async run(channelId) {
+      calls.run.push(channelId);
+      if (channelId === "channel-1") throw new Error("backend reset channel");
+      return { output: "ok", exitCode: 0 };
+    },
+    async interrupt() {},
+    async close() {},
+  });
+
+  await assert.rejects(
+    registry.execute(action("surface-a", "session-a", "uptime")),
+    /backend reset channel/
+  );
+  const outcome = await registry.execute(
+    action("surface-a", "session-a", "uptime")
+  );
+
+  assert.equal(outcome.status, "completed");
+  assert.deepEqual(calls.run, ["channel-1", "channel-2"]);
 });

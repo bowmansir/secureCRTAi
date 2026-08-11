@@ -380,43 +380,43 @@ pub async fn open(
     Ok(Arc::new(SshTermSession { tx }))
 }
 
-const SHELL_INTEGRATION_NONCE_PLACEHOLDER: &str = "__TERMAI_NONCE__";
+const SHELL_INTEGRATION_NONCE_PLACEHOLDER: &str = "__TERMEXA_NONCE__";
 const SHELL_INTEGRATION_BOOTSTRAP_TEMPLATE: &str =
-    " stty -echo 2>/dev/null; printf '\\033]633;TermAI;__TERMAI_NONCE__;B\\007'\r";
+    " stty -echo 2>/dev/null; printf '\\033]633;Termexa;__TERMEXA_NONCE__;B\\007'\r";
 
 const SHELL_INTEGRATION_BODY_TEMPLATE: &str = concat!(
-    "__termai_emit_command(){ ",
-    "__termai_cmd=${1:-}; ",
-    "if [ -z \"$__termai_cmd\" ]; then ",
-    "__termai_cmd=$(history 1 2>/dev/null | sed 's/^ *[0-9][0-9]* *//'); fi; ",
-    "__termai_cmd_b64=$(printf '%s' \"$__termai_cmd\" | base64 2>/dev/null | tr -d '\\r\\n'); ",
-    "printf '\\033]633;TermAI;__TERMAI_NONCE__;C;%s\\007' \"$__termai_cmd_b64\"; }; ",
-    "__termai_emit_prompt(){ __termai_prompt_status=$?; ",
-    "__termai_status=${__termai_status_captured:-$__termai_prompt_status}; ",
-    "unset __termai_status_captured; ",
-    "__termai_cwd=$(printf '%s' \"$PWD\" | base64 2>/dev/null | tr -d '\\r\\n'); ",
-    "printf '\\033]633;TermAI;__TERMAI_NONCE__;P;%s;%s;\\007' \"$__termai_status\" \"$__termai_cwd\"; ",
-    "__termai_preexec_armed=1; ",
-    "return \"$__termai_status\"; }; ",
-    "__termai_emit_preexec(){ __termai_debug_status=$?; ",
-    "if [ \"${__termai_preexec_armed:-0}\" = 1 ]; then ",
-    "__termai_preexec_armed=0; unset __termai_status_captured; ",
-    "__termai_emit_command \"${1:-}\"; ",
-    "elif [ -z \"${__termai_status_captured+x}\" ]; then ",
-    "__termai_status_captured=$__termai_debug_status; fi; }; ",
-    "__termai_preexec_armed=0; ",
+    "__termexa_emit_command(){ ",
+    "__termexa_cmd=${1:-}; ",
+    "if [ -z \"$__termexa_cmd\" ]; then ",
+    "__termexa_cmd=$(history 1 2>/dev/null | sed 's/^ *[0-9][0-9]* *//'); fi; ",
+    "__termexa_cmd_b64=$(printf '%s' \"$__termexa_cmd\" | base64 2>/dev/null | tr -d '\\r\\n'); ",
+    "printf '\\033]633;Termexa;__TERMEXA_NONCE__;C;%s\\007' \"$__termexa_cmd_b64\"; }; ",
+    "__termexa_emit_prompt(){ __termexa_prompt_status=$?; ",
+    "__termexa_status=${__termexa_status_captured:-$__termexa_prompt_status}; ",
+    "unset __termexa_status_captured; ",
+    "__termexa_cwd=$(printf '%s' \"$PWD\" | base64 2>/dev/null | tr -d '\\r\\n'); ",
+    "printf '\\033]633;Termexa;__TERMEXA_NONCE__;P;%s;%s;\\007' \"$__termexa_status\" \"$__termexa_cwd\"; ",
+    "__termexa_preexec_armed=1; ",
+    "return \"$__termexa_status\"; }; ",
+    "__termexa_emit_preexec(){ __termexa_debug_status=$?; ",
+    "if [ \"${__termexa_preexec_armed:-0}\" = 1 ]; then ",
+    "__termexa_preexec_armed=0; unset __termexa_status_captured; ",
+    "__termexa_emit_command \"${1:-}\"; ",
+    "elif [ -z \"${__termexa_status_captured+x}\" ]; then ",
+    "__termexa_status_captured=$__termexa_debug_status; fi; }; ",
+    "__termexa_preexec_armed=0; ",
     "if [ -n \"${BASH_VERSION:-}\" ]; then ",
     "if [ -z \"$(trap -p DEBUG 2>/dev/null)\" ]; then ",
-    "PROMPT_COMMAND=\"${PROMPT_COMMAND:+$PROMPT_COMMAND;}__termai_emit_prompt\"; ",
-    "__termai_shell=bash; trap '__termai_emit_preexec' DEBUG; ",
-    "else __termai_shell=raw; fi; ",
+    "PROMPT_COMMAND=\"${PROMPT_COMMAND:+$PROMPT_COMMAND;}__termexa_emit_prompt\"; ",
+    "__termexa_shell=bash; trap '__termexa_emit_preexec' DEBUG; ",
+    "else __termexa_shell=raw; fi; ",
     "elif [ -n \"${ZSH_VERSION:-}\" ]; then ",
     "autoload -Uz add-zsh-hook 2>/dev/null && ",
-    "add-zsh-hook precmd __termai_emit_prompt && ",
-    "add-zsh-hook preexec __termai_emit_preexec; ",
-    "__termai_shell=zsh; ",
-    "else __termai_shell=raw; fi; ",
-    "printf '\\033]633;TermAI;__TERMAI_NONCE__;H;%s\\007' \"$__termai_shell\"; ",
+    "add-zsh-hook precmd __termexa_emit_prompt && ",
+    "add-zsh-hook preexec __termexa_emit_preexec; ",
+    "__termexa_shell=zsh; ",
+    "else __termexa_shell=raw; fi; ",
+    "printf '\\033]633;Termexa;__TERMEXA_NONCE__;H;%s\\007' \"$__termexa_shell\"; ",
     "stty echo 2>/dev/null; true\r"
 );
 
@@ -537,7 +537,7 @@ fn strip_integration_install_echo(mut bytes: Vec<u8>) -> Vec<u8> {
             .position(|byte| *byte == b'\n')
             .map_or(bytes.len(), |offset| {
                 command_start + COMMAND.len() + offset + 1
-        });
+            });
         bytes.drain(line_start..line_end);
     }
     bytes

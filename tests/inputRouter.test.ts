@@ -2,12 +2,54 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  canRouteTerminalSubmission,
   classifyTerminalInput,
   extractTerminalPromptInput,
   isLikelyShellPrompt,
   splitTerminalSubmissionData,
   updateTerminalInputCapture,
 } from "../src/terminal/inputRouter.ts";
+
+test("high-confidence Agent input survives an unreliable IME capture", () => {
+  const naturalLanguage = classifyTerminalInput(
+    "访问提示的证书还是旧证书",
+    "auto",
+    true
+  );
+  assert.equal(
+    canRouteTerminalSubmission({
+      submittedText: "访问提示的证书还是旧证书",
+      inputStartedAtPrompt: true,
+      captureReliable: false,
+      recoveredFromTerminal: false,
+      decision: naturalLanguage,
+    }),
+    true
+  );
+
+  const shellCommand = classifyTerminalInput("nginx -t", "auto", true);
+  assert.equal(
+    canRouteTerminalSubmission({
+      submittedText: "nginx -t",
+      inputStartedAtPrompt: true,
+      captureReliable: false,
+      recoveredFromTerminal: false,
+      decision: shellCommand,
+    }),
+    false
+  );
+
+  assert.equal(
+    canRouteTerminalSubmission({
+      submittedText: "访问提示的证书还是旧证书",
+      inputStartedAtPrompt: false,
+      captureReliable: false,
+      recoveredFromTerminal: false,
+      decision: naturalLanguage,
+    }),
+    false
+  );
+});
 
 test("auto mode keeps explicit commands in shell", () => {
   const inputs = [

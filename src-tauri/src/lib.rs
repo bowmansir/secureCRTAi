@@ -1,5 +1,6 @@
 mod agent;
 mod ai;
+mod desktop_update;
 mod forward;
 mod hostkeys;
 mod keys;
@@ -122,8 +123,10 @@ fn ssh_params_from_profile(state: &AppState, session_id: &str) -> Result<SshPara
 
 type CmdResult<T> = Result<T, String>;
 
-const AGENT_RUN_COMMAND_TIMEOUT: Duration = Duration::from_secs(35);
+const AGENT_RUN_COMMAND_GRACE: Duration = Duration::from_secs(5);
+const AGENT_CONTROL_TIMEOUT: Duration = Duration::from_secs(4);
 const HEALTH_CHECK_CONCURRENCY: usize = 20;
+const SSH_CONNECTION_TEST_TIMEOUT: Duration = Duration::from_secs(12);
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -206,6 +209,45 @@ mod tests {
             key_path: None,
             key_passphrase_enc: None,
         }
+    }
+
+    fn test_session_input(auth_type: &str) -> SessionInput {
+        SessionInput {
+            id: None,
+            name: "test".to_string(),
+            group: String::new(),
+            host: " 127.0.0.1 ".to_string(),
+            port: 22,
+            username: "  ".to_string(),
+            auth_type: auth_type.to_string(),
+            password: Some("secret".to_string()),
+            key_path: Some("C:\\test\\id_ed25519".to_string()),
+            key_passphrase: Some("key-secret".to_string()),
+        }
+    }
+
+    #[test]
+    fn session_connection_test_defaults_blank_username_to_root() {
+        let params =
+            test_params_from_input(&test_session_input("password"), None).expect("test params");
+
+        assert_eq!(params.host, "127.0.0.1");
+        assert_eq!(params.username, "root");
+    }
+
+    #[test]
+    fn session_connection_test_uses_only_selected_authentication_method() {
+        let password_params =
+            test_params_from_input(&test_session_input("password"), None).expect("password params");
+        assert_eq!(password_params.password.as_deref(), Some("secret"));
+        assert_eq!(password_params.key_path, None);
+        assert_eq!(password_params.key_passphrase, None);
+
+        let key_params =
+            test_params_from_input(&test_session_input("key"), None).expect("key params");
+        assert_eq!(key_params.password, None);
+        assert_eq!(key_params.key_path.as_deref(), Some("C:\\test\\id_ed25519"));
+        assert_eq!(key_params.key_passphrase.as_deref(), Some("key-secret"));
     }
 
     #[tokio::test]
@@ -379,9 +421,16 @@ async fn agent_run(
     state: State<'_, AppState>,
     id: String,
     command: String,
+    timeout_ms: u64,
 ) -> CmdResult<agent::AgentRunResult> {
     let session = state.agents.get(&id).ok_or("Agent 会话不存在")?;
-    match tokio::time::timeout(AGENT_RUN_COMMAND_TIMEOUT, session.run(command)).await {
+    let run_timeout = agent::bounded_run_timeout(timeout_ms);
+    match tokio::time::timeout(
+        run_timeout + AGENT_RUN_COMMAND_GRACE,
+        session.run_with_timeout(command, run_timeout),
+    )
+    .await
+    {
         Ok(result) => result.map_err(err_str),
         Err(_) => {
             if let Some(s) = state.agents.remove(&id) {
@@ -395,7 +444,15 @@ async fn agent_run(
 #[tauri::command]
 async fn agent_interrupt(state: State<'_, AppState>, id: String) -> CmdResult<()> {
     let session = state.agents.get(&id).ok_or("Agent 会话不存在")?;
-    session.interrupt().await.map_err(err_str)
+    match tokio::time::timeout(AGENT_CONTROL_TIMEOUT, session.interrupt()).await {
+        Ok(result) => result.map_err(err_str),
+        Err(_) => {
+            if let Some(s) = state.agents.remove(&id) {
+                s.close();
+            }
+            Err("Agent 中断超时，已重置执行通道".to_string())
+        }
+    }
 }
 
 #[tauri::command]
@@ -896,7 +953,7 @@ fn list_ssh_keys() -> Vec<String> {
 async fn open_new_window(app: tauri::AppHandle) -> CmdResult<()> {
     let label = format!("term-{}", Uuid::new_v4().simple());
     tauri::WebviewWindowBuilder::new(&app, label, tauri::WebviewUrl::default())
-        .title("TermAI")
+        .title("Termexa")
         .inner_size(1280.0, 800.0)
         .min_inner_size(900.0, 600.0)
         .build()
@@ -922,6 +979,61 @@ struct SessionInput {
     password: Option<String>,
     key_path: Option<String>,
     key_passphrase: Option<String>,
+}
+
+fn normalized_session_username(username: &str) -> String {
+    let username = username.trim();
+    if username.is_empty() {
+        "root".to_string()
+    } else {
+        username.to_string()
+    }
+}
+
+fn test_params_from_input(
+    input: &SessionInput,
+    existing: Option<&SessionProfile>,
+) -> CmdResult<SshParams> {
+    let stored_secret = |encrypted: Option<&String>| -> CmdResult<Option<String>> {
+        match encrypted {
+            Some(value) if !value.is_empty() => Ok(Some(vault::decrypt(value).map_err(err_str)?)),
+            None => Ok(None),
+            Some(_) => Ok(None),
+        }
+    };
+    let password = match &input.password {
+        Some(value) => Some(value.clone()),
+        None => stored_secret(existing.and_then(|profile| profile.password_enc.as_ref()))?,
+    };
+    let key_passphrase = match &input.key_passphrase {
+        Some(value) => Some(value.clone()),
+        None => stored_secret(existing.and_then(|profile| profile.key_passphrase_enc.as_ref()))?,
+    };
+    let key_path = input
+        .key_path
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| existing.and_then(|profile| profile.key_path.clone()));
+
+    let (password, key_path, key_passphrase) = match input.auth_type.as_str() {
+        "password" => (password, None, None),
+        "key" => {
+            if key_path.is_none() {
+                return Err("请选择私钥文件".to_string());
+            }
+            (None, key_path, key_passphrase)
+        }
+        _ => return Err("不支持的 SSH 认证方式".to_string()),
+    };
+
+    Ok(SshParams {
+        host: input.host.trim().to_string(),
+        port: input.port,
+        username: normalized_session_username(&input.username),
+        password,
+        key_path,
+        key_passphrase,
+    })
 }
 
 #[tauri::command]
@@ -970,6 +1082,55 @@ async fn health_check_sessions(
     Ok(results)
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionConnectionTestResult {
+    latency_ms: u64,
+    message: String,
+}
+
+#[tauri::command]
+async fn session_test_connection(
+    state: State<'_, AppState>,
+    input: SessionInput,
+) -> CmdResult<SessionConnectionTestResult> {
+    if input.host.trim().is_empty() {
+        return Err("主机为必填项".to_string());
+    }
+    if input.port == 0 {
+        return Err("端口必须在 1 到 65535 之间".to_string());
+    }
+    let existing = input
+        .id
+        .as_deref()
+        .and_then(|id| state.store.get_session(id));
+    let params = test_params_from_input(&input, existing.as_ref())?;
+    let started = Instant::now();
+    let handle = match timeout(
+        SSH_CONNECTION_TEST_TIMEOUT,
+        terminal::ssh::connect_and_auth(state.hostkeys.clone(), &params),
+    )
+    .await
+    {
+        Ok(result) => result.map_err(err_str)?,
+        Err(_) => return Err("SSH 连接测试超时（12 秒），请检查主机、端口和网络".to_string()),
+    };
+    let latency_ms = started.elapsed().as_millis() as u64;
+    let _ = timeout(
+        Duration::from_secs(1),
+        handle.disconnect(
+            russh::Disconnect::ByApplication,
+            "connection test complete",
+            "",
+        ),
+    )
+    .await;
+    Ok(SessionConnectionTestResult {
+        latency_ms,
+        message: "SSH 握手与认证通过".to_string(),
+    })
+}
+
 #[tauri::command]
 fn session_save(state: State<'_, AppState>, input: SessionInput) -> CmdResult<SessionProfile> {
     let existing = input
@@ -993,7 +1154,7 @@ fn session_save(state: State<'_, AppState>, input: SessionInput) -> CmdResult<Se
         group: input.group,
         host: input.host,
         port: input.port,
-        username: input.username,
+        username: normalized_session_username(&input.username),
         auth_type: input.auth_type,
         password_enc: encrypt_or_keep(
             &input.password,
@@ -1085,10 +1246,7 @@ fn theme_get_preferences(state: State<'_, AppState>) -> CmdResult<Option<ThemePr
         preferences.color_theme.as_str(),
         "dark" | "midnight" | "light"
     ) {
-        preferences = state
-            .store
-            .set_color_theme("dark")
-            .map_err(err_str)?;
+        preferences = state.store.set_color_theme("dark").map_err(err_str)?;
     }
     if preferences
         .background_theme_id
@@ -1286,6 +1444,8 @@ pub fn run() {
     let store = Store::load().expect("初始化配置存储失败");
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .on_window_event(|window, event| {
             if window.label() == "main" {
                 if let tauri::WindowEvent::CloseRequested { api, .. } = event {
@@ -1363,6 +1523,7 @@ pub fn run() {
             open_new_window,
             sessions_list,
             health_check_sessions,
+            session_test_connection,
             session_save,
             session_delete,
             snippets_list,
@@ -1385,6 +1546,7 @@ pub fn run() {
             theme_get_preferences,
             theme_set_color,
             theme_set_background,
+            desktop_update::desktop_probe_report,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -435,7 +435,7 @@ export default function SftpCliView({
       return true;
     });
 
-    term.writeln("\x1b[90mTermAI SFTP 命令行 — 输入 help 查看命令，get/put 自动进入传输队列\x1b[0m");
+    term.writeln("\x1b[90mTermexa SFTP 命令行 — 输入 help 查看命令，get/put 自动进入传输队列\x1b[0m");
 
     Promise.all([api.sftpOpen(tab.sessionId!), api.localHome()])
       .then(([{ id, home }, localHome]) => {

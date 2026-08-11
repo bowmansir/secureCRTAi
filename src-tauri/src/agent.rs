@@ -12,8 +12,13 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{sleep, Duration};
 
-const AGENT_RUN_TIMEOUT: Duration = Duration::from_secs(30);
 const AGENT_INTERRUPT_GRACE: Duration = Duration::from_secs(3);
+const AGENT_RUN_TIMEOUT_MIN_MS: u64 = 1_000;
+const AGENT_RUN_TIMEOUT_MAX_MS: u64 = 120_000;
+
+pub fn bounded_run_timeout(timeout_ms: u64) -> Duration {
+    Duration::from_millis(timeout_ms.clamp(AGENT_RUN_TIMEOUT_MIN_MS, AGENT_RUN_TIMEOUT_MAX_MS))
+}
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -25,6 +30,7 @@ pub struct AgentRunResult {
 enum AgentCmd {
     Run {
         command: String,
+        timeout: Duration,
         reply: oneshot::Sender<anyhow::Result<AgentRunResult>>,
     },
     Interrupt {
@@ -38,10 +44,18 @@ pub struct AgentSession {
 }
 
 impl AgentSession {
-    pub async fn run(&self, command: String) -> anyhow::Result<AgentRunResult> {
+    pub async fn run_with_timeout(
+        &self,
+        command: String,
+        timeout: Duration,
+    ) -> anyhow::Result<AgentRunResult> {
         let (reply, rx) = oneshot::channel();
         self.tx
-            .send(AgentCmd::Run { command, reply })
+            .send(AgentCmd::Run {
+                command,
+                timeout,
+                reply,
+            })
             .map_err(|_| anyhow!("Agent 通道已关闭"))?;
         rx.await.map_err(|_| anyhow!("Agent 执行无响应"))?
     }
@@ -139,7 +153,7 @@ fn find_marker(s: &str, marker: &str) -> Option<(usize, i32)> {
 }
 
 fn gen_marker(tag: &str) -> String {
-    format!("__TERMAI_{tag}_{}__", uuid::Uuid::new_v4().simple())
+    format!("__TERMEXA_{tag}_{}__", uuid::Uuid::new_v4().simple())
 }
 
 fn append_agent_note(output: String, note: &str) -> String {
@@ -195,7 +209,11 @@ pub async fn open(
         // 主循环：请求-响应式执行
         loop {
             match rx.recv().await {
-                Some(AgentCmd::Run { command, reply }) => {
+                Some(AgentCmd::Run {
+                    command,
+                    timeout,
+                    reply,
+                }) => {
                     let marker = gen_marker("END");
                     let payload = format!("{command}\necho {marker}$?\n");
                     if channel.data(payload.as_bytes()).await.is_err() {
@@ -204,53 +222,77 @@ pub async fn open(
                     }
                     let mut close_channel = false;
                     let mut rbuf: Vec<u8> = Vec::new();
-                    let run_timeout = sleep(AGENT_RUN_TIMEOUT);
+                    let run_timeout = sleep(timeout);
                     tokio::pin!(run_timeout);
 
                     let result = loop {
                         tokio::select! {
                             _ = &mut run_timeout => {
                                 let cleanup_marker = gen_marker("INT");
-                                let _ = channel.data(&[3u8][..]).await;
                                 let cleanup_cmd = format!("\necho {cleanup_marker}$?\n");
-                                let _ = channel.data(cleanup_cmd.as_bytes()).await;
-
-                                let cleanup_timeout = sleep(AGENT_INTERRUPT_GRACE);
-                                tokio::pin!(cleanup_timeout);
-                                let recovered_output = loop {
-                                    tokio::select! {
-                                        _ = &mut cleanup_timeout => {
-                                            close_channel = true;
-                                            let s = String::from_utf8_lossy(&strip_ansi(&rbuf)).trim().to_string();
-                                            break s;
-                                        }
-                                        msg = channel.wait() => {
-                                            match msg {
+                                let cleanup = tokio::time::timeout(
+                                    AGENT_INTERRUPT_GRACE,
+                                    async {
+                                        channel.data(&[3u8][..]).await.map_err(|_| ())?;
+                                        channel
+                                            .data(cleanup_cmd.as_bytes())
+                                            .await
+                                            .map_err(|_| ())?;
+                                        loop {
+                                            match channel.wait().await {
                                                 Some(ChannelMsg::Data { data }) => {
                                                     rbuf.extend_from_slice(&data);
-                                                    let s = String::from_utf8_lossy(&strip_ansi(&rbuf)).to_string();
-                                                    if let Some((pos, _code)) = find_marker(&s, &cleanup_marker) {
-                                                        break s[..pos].trim_matches(['\n', ' ', '\t']).to_string();
+                                                    let s = String::from_utf8_lossy(
+                                                        &strip_ansi(&rbuf),
+                                                    )
+                                                    .to_string();
+                                                    if let Some((pos, _code)) =
+                                                        find_marker(&s, &cleanup_marker)
+                                                    {
+                                                        break Ok((
+                                                            s[..pos]
+                                                                .trim_matches(['\n', ' ', '\t'])
+                                                                .to_string(),
+                                                            false,
+                                                        ));
                                                     }
                                                 }
                                                 Some(ChannelMsg::ExtendedData { data, .. }) => {
                                                     rbuf.extend_from_slice(&data);
                                                 }
-                                                Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => {
-                                                    close_channel = true;
-                                                    let s = String::from_utf8_lossy(&strip_ansi(&rbuf)).trim().to_string();
-                                                    break s;
+                                                Some(ChannelMsg::Eof)
+                                                | Some(ChannelMsg::Close)
+                                                | None => {
+                                                    let s = String::from_utf8_lossy(
+                                                        &strip_ansi(&rbuf),
+                                                    )
+                                                    .trim()
+                                                    .to_string();
+                                                    break Ok((s, true));
                                                 }
                                                 _ => {}
                                             }
                                         }
+                                    },
+                                )
+                                .await;
+                                let recovered_output = match cleanup {
+                                    Ok(Ok((output, channel_closed))) => {
+                                        close_channel = channel_closed;
+                                        output
+                                    }
+                                    Ok(Err(())) | Err(_) => {
+                                        close_channel = true;
+                                        String::from_utf8_lossy(&strip_ansi(&rbuf))
+                                            .trim()
+                                            .to_string()
                                     }
                                 };
 
                                 let note = if close_channel {
-                                    "Agent 命令超过 30 秒，已自动中断并关闭执行通道。"
+                                    "Agent 命令执行超时，已自动中断并关闭执行通道。"
                                 } else {
-                                    "Agent 命令超过 30 秒，已自动中断。"
+                                    "Agent 命令执行超时，已自动中断。"
                                 };
                                 break Ok(AgentRunResult {
                                     output: append_agent_note(recovered_output, note),
@@ -290,39 +332,71 @@ pub async fn open(
                                 match control {
                                     Some(AgentCmd::Interrupt { reply: interrupt_reply }) => {
                                         let cleanup_marker = gen_marker("INT");
-                                        let _ = channel.data(&[3u8][..]).await;
                                         let cleanup_cmd = format!("\necho {cleanup_marker}$?\n");
-                                        let _ = channel.data(cleanup_cmd.as_bytes()).await;
-
-                                        let cleanup_timeout = sleep(AGENT_INTERRUPT_GRACE);
-                                        tokio::pin!(cleanup_timeout);
-                                        let recovered_output = loop {
-                                            tokio::select! {
-                                                _ = &mut cleanup_timeout => {
-                                                    close_channel = true;
-                                                    let s = String::from_utf8_lossy(&strip_ansi(&rbuf)).trim().to_string();
-                                                    break s;
-                                                }
-                                                msg = channel.wait() => {
-                                                    match msg {
+                                        let cleanup = tokio::time::timeout(
+                                            AGENT_INTERRUPT_GRACE,
+                                            async {
+                                                channel
+                                                    .data(&[3u8][..])
+                                                    .await
+                                                    .map_err(|_| ())?;
+                                                channel
+                                                    .data(cleanup_cmd.as_bytes())
+                                                    .await
+                                                    .map_err(|_| ())?;
+                                                loop {
+                                                    match channel.wait().await {
                                                         Some(ChannelMsg::Data { data }) => {
                                                             rbuf.extend_from_slice(&data);
-                                                            let s = String::from_utf8_lossy(&strip_ansi(&rbuf)).to_string();
-                                                            if let Some((pos, _code)) = find_marker(&s, &cleanup_marker) {
-                                                                break s[..pos].trim_matches(['\n', ' ', '\t']).to_string();
+                                                            let s = String::from_utf8_lossy(
+                                                                &strip_ansi(&rbuf),
+                                                            )
+                                                            .to_string();
+                                                            if let Some((pos, _code)) =
+                                                                find_marker(&s, &cleanup_marker)
+                                                            {
+                                                                break Ok((
+                                                                    s[..pos]
+                                                                        .trim_matches([
+                                                                            '\n', ' ', '\t',
+                                                                        ])
+                                                                        .to_string(),
+                                                                    false,
+                                                                ));
                                                             }
                                                         }
-                                                        Some(ChannelMsg::ExtendedData { data, .. }) => {
+                                                        Some(ChannelMsg::ExtendedData {
+                                                            data,
+                                                            ..
+                                                        }) => {
                                                             rbuf.extend_from_slice(&data);
                                                         }
-                                                        Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => {
-                                                            close_channel = true;
-                                                            let s = String::from_utf8_lossy(&strip_ansi(&rbuf)).trim().to_string();
-                                                            break s;
+                                                        Some(ChannelMsg::Eof)
+                                                        | Some(ChannelMsg::Close)
+                                                        | None => {
+                                                            let s = String::from_utf8_lossy(
+                                                                &strip_ansi(&rbuf),
+                                                            )
+                                                            .trim()
+                                                            .to_string();
+                                                            break Ok((s, true));
                                                         }
                                                         _ => {}
                                                     }
                                                 }
+                                            },
+                                        )
+                                        .await;
+                                        let recovered_output = match cleanup {
+                                            Ok(Ok((output, channel_closed))) => {
+                                                close_channel = channel_closed;
+                                                output
+                                            }
+                                            Ok(Err(())) | Err(_) => {
+                                                close_channel = true;
+                                                String::from_utf8_lossy(&strip_ansi(&rbuf))
+                                                    .trim()
+                                                    .to_string()
                                             }
                                         };
                                         let _ = interrupt_reply.send(Ok(()));
@@ -337,7 +411,11 @@ pub async fn open(
                                         });
                                     }
                                     Some(AgentCmd::Close) | None => {
-                                        let _ = channel.data(&[3u8][..]).await;
+                                        let _ = tokio::time::timeout(
+                                            AGENT_INTERRUPT_GRACE,
+                                            channel.data(&[3u8][..]),
+                                        )
+                                        .await;
                                         close_channel = true;
                                         break Err(anyhow!("Agent 通道已关闭"));
                                     }
@@ -350,12 +428,12 @@ pub async fn open(
                     };
                     let _ = reply.send(result);
                     if close_channel {
-                        let _ = channel.eof().await;
+                        let _ = tokio::time::timeout(AGENT_INTERRUPT_GRACE, channel.eof()).await;
                         break;
                     }
                 }
                 Some(AgentCmd::Close) | None => {
-                    let _ = channel.eof().await;
+                    let _ = tokio::time::timeout(AGENT_INTERRUPT_GRACE, channel.eof()).await;
                     break;
                 }
                 Some(AgentCmd::Interrupt { reply }) => {
@@ -371,6 +449,13 @@ pub async fn open(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_timeout_is_bounded_for_the_runtime_contract() {
+        assert_eq!(bounded_run_timeout(0), Duration::from_secs(1));
+        assert_eq!(bounded_run_timeout(35_000), Duration::from_secs(35));
+        assert_eq!(bounded_run_timeout(999_999), Duration::from_secs(120));
+    }
 
     #[tokio::test]
     async fn interrupt_request_waits_for_runtime_acknowledgement() {

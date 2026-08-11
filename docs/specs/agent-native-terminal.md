@@ -5,7 +5,7 @@
 
 ## 目标
 
-将 TermAI 从“终端 + 独立 AI 面板”逐步演进为 Agent 原生远程终端：
+将 Termexa 从“终端 + 独立 AI 面板”逐步演进为 Agent 原生远程终端：
 
 - 用户在终端内输入命令或自然语言，不必反复手动切换入口。
 - Shell 命令、Agent 操作、真实输出和最终结论共享同一个会话上下文。
@@ -16,7 +16,7 @@
 ## 最终交互骨架
 
 参考 Warp 的 surface-scoped input model、Block 时间线和 Agent input footer 思路，
-TermAI 最终采用以下结构：
+Termexa 最终采用以下结构：
 
 1. **一个终端 Surface 一套状态**：输入模式、Shell Block、Agent Conversation、执行控制和上下文都按标签隔离。
 2. **一个统一输入入口**：同一编辑器接受 Shell 命令和自然语言，通过自动检测或手动锁定决定目标。

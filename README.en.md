@@ -1,12 +1,12 @@
-# TermAI
+# Termexa
 
 [English](README.md) | [中文](README.zh.md)
 
-**TermAI is an AI-native remote terminal manager.**
+**Termexa is an AI-native remote terminal manager.**
 
 It brings SSH terminals, SFTP workflows, port forwarding, key utilities, and an AI operations assistant into one desktop app, helping engineers move from memorizing commands to describing intent, reviewing actions, and shipping fixes faster.
 
-TermAI is not just a chat box beside a terminal. It is designed as an operations copilot that understands the active session, terminal output, and server context while keeping execution under user control.
+Termexa is not just a chat box beside a terminal. It is designed as an operations copilot that understands the active session, terminal output, and server context while keeping execution under user control.
 
 ## Highlights
 
@@ -123,4 +123,4 @@ docs/
 
 ## Product Direction
 
-TermAI aims to become an AI-native alternative to SecureCRT and Xshell: keeping the reliability, status visibility, and fleet-management workflow of professional terminal tools, while deeply integrating AI into command generation, error diagnosis, contextual explanations, and controlled automation.
+Termexa aims to become an AI-native alternative to SecureCRT and Xshell: keeping the reliability, status visibility, and fleet-management workflow of professional terminal tools, while deeply integrating AI into command generation, error diagnosis, contextual explanations, and controlled automation.

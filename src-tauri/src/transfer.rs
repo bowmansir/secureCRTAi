@@ -739,7 +739,7 @@ mod resume_smoke_tests {
     use std::process::Command;
     use tokio::time::{sleep, Duration};
 
-    const USER: &str = "termai";
+    const USER: &str = "termexa";
     const PASS: &str = "resume-pass";
     const FULL_SIZE: u64 = 841 * 1024 * 1024;
     const PARTIAL_SIZE: u64 = 512 * 1024 * 1024;
@@ -817,7 +817,7 @@ mod resume_smoke_tests {
             "-p".into(),
             port_map,
             "--mount".into(),
-            "type=tmpfs,destination=/home/termai/upload,tmpfs-size=64k".into(),
+            "type=tmpfs,destination=/home/termexa/upload,tmpfs-size=64k".into(),
             "atmoz/sftp:latest".into(),
             format!("{USER}:{PASS}:::upload"),
         ])?;
@@ -948,17 +948,17 @@ mod resume_smoke_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "requires Docker and TERMAI_RESUME_SMOKE=1"]
+    #[ignore = "requires Docker and TERMEXA_RESUME_SMOKE=1"]
     async fn resumes_large_remote_file_and_directory_transfers() -> anyhow::Result<()> {
-        if std::env::var("TERMAI_RESUME_SMOKE").ok().as_deref() != Some("1") {
-            eprintln!("skipped; set TERMAI_RESUME_SMOKE=1 to run the Docker smoke test");
+        if std::env::var("TERMEXA_RESUME_SMOKE").ok().as_deref() != Some("1") {
+            eprintln!("skipped; set TERMEXA_RESUME_SMOKE=1 to run the Docker smoke test");
             return Ok(());
         }
 
         let (src_port, dst_port) = free_ports()?;
         let suffix = std::process::id();
-        let src_name = format!("termai-resume-src-{suffix}");
-        let dst_name = format!("termai-resume-dst-{suffix}");
+        let src_name = format!("termexa-resume-src-{suffix}");
+        let dst_name = format!("termexa-resume-dst-{suffix}");
         let _guard = DockerGuard::new(vec![src_name.clone(), dst_name.clone()]);
 
         start_sftp_container(&src_name, src_port)?;
@@ -1008,24 +1008,24 @@ mod resume_smoke_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "requires Docker and TERMAI_TRANSFER_SMOKE=1"]
+    #[ignore = "requires Docker and TERMEXA_TRANSFER_SMOKE=1"]
     async fn uploads_and_downloads_file_with_verified_size() -> anyhow::Result<()> {
-        if std::env::var("TERMAI_TRANSFER_SMOKE").ok().as_deref() != Some("1") {
-            eprintln!("skipped; set TERMAI_TRANSFER_SMOKE=1 to run the Docker smoke test");
+        if std::env::var("TERMEXA_TRANSFER_SMOKE").ok().as_deref() != Some("1") {
+            eprintln!("skipped; set TERMEXA_TRANSFER_SMOKE=1 to run the Docker smoke test");
             return Ok(());
         }
 
         let (port, _) = free_ports()?;
         let suffix = std::process::id();
-        let name = format!("termai-transfer-{suffix}");
+        let name = format!("termexa-transfer-{suffix}");
         let _guard = DockerGuard::new(vec![name.clone()]);
 
         start_sftp_container(&name, port)?;
         let conn = open_sftp(port).await?;
 
-        let upload_local = std::env::temp_dir().join(format!("termai-upload-{suffix}.txt"));
-        let download_local = std::env::temp_dir().join(format!("termai-download-{suffix}.txt"));
-        let content = b"termai verified transfer\n";
+        let upload_local = std::env::temp_dir().join(format!("termexa-upload-{suffix}.txt"));
+        let download_local = std::env::temp_dir().join(format!("termexa-download-{suffix}.txt"));
+        let content = b"termexa verified transfer\n";
         std::fs::write(&upload_local, content)?;
 
         let upload_events = Arc::new(Mutex::new(Vec::new()));
@@ -1063,22 +1063,22 @@ mod resume_smoke_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "requires Docker and TERMAI_FULL_UPLOAD_SMOKE=1"]
+    #[ignore = "requires Docker and TERMEXA_FULL_UPLOAD_SMOKE=1"]
     async fn reports_error_when_remote_upload_cannot_store_file() -> anyhow::Result<()> {
-        if std::env::var("TERMAI_FULL_UPLOAD_SMOKE").ok().as_deref() != Some("1") {
-            eprintln!("skipped; set TERMAI_FULL_UPLOAD_SMOKE=1 to run the Docker smoke test");
+        if std::env::var("TERMEXA_FULL_UPLOAD_SMOKE").ok().as_deref() != Some("1") {
+            eprintln!("skipped; set TERMEXA_FULL_UPLOAD_SMOKE=1 to run the Docker smoke test");
             return Ok(());
         }
 
         let (port, _) = free_ports()?;
         let suffix = std::process::id();
-        let name = format!("termai-full-upload-{suffix}");
+        let name = format!("termexa-full-upload-{suffix}");
         let _guard = DockerGuard::new(vec![name.clone()]);
 
         start_tiny_upload_sftp_container(&name, port)?;
         let conn = open_sftp(port).await?;
 
-        let local = std::env::temp_dir().join(format!("termai-full-upload-{suffix}.bin"));
+        let local = std::env::temp_dir().join(format!("termexa-full-upload-{suffix}.bin"));
         std::fs::File::create(&local)?.set_len(1024 * 1024)?;
 
         let events = Arc::new(Mutex::new(Vec::new()));

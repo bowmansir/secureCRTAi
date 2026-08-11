@@ -3,15 +3,17 @@ import test from "node:test";
 
 import {
   decideTerminalInput,
+  getInputModeIndicator,
+  resolvePromptInputTarget,
   resolveInputTargetForDisplay,
-  shouldResetManualOverride,
+  toggleFixedInputMode,
 } from "../src/terminal/inputDecisionModel.ts";
 
 test("raw terminal always keeps input in shell", () => {
   const decision = decideTerminalInput({
     text: "分析当前进程",
     agentAvailable: true,
-    manualOverride: "agent",
+    routingMode: "agent",
     rawTerminal: true,
   });
 
@@ -23,17 +25,17 @@ test("raw terminal always keeps input in shell", () => {
   });
 });
 
-test("manual override applies to one draft and reports its source", () => {
+test("fixed routing mode persists as an explicit decision source", () => {
   assert.deepEqual(
     decideTerminalInput({
       text: "ls -la",
       agentAvailable: true,
-      manualOverride: "agent",
+      routingMode: "agent",
     }),
     {
       target: "agent",
       confidence: 1,
-      decisionSource: "manual-agent",
+      decisionSource: "fixed-agent",
       automatic: false,
     }
   );
@@ -42,21 +44,34 @@ test("manual override applies to one draft and reports its source", () => {
     decideTerminalInput({
       text: "分析服务器",
       agentAvailable: true,
-      manualOverride: "shell",
+      routingMode: "shell",
     }).decisionSource,
-    "manual-shell"
+    "fixed-shell"
   );
 });
 
-test("manual override resets only when a non-empty draft is cleared", () => {
-  assert.equal(shouldResetManualOverride("分析服务器", ""), true);
-  assert.equal(shouldResetManualOverride("分析服务器", "   "), true);
-  assert.equal(shouldResetManualOverride("", ""), false);
-  assert.equal(shouldResetManualOverride("", "分析服务器"), false);
-  assert.equal(
-    shouldResetManualOverride("分析服务器", "继续分析服务器"),
-    false
-  );
+test("automatic and fixed modes expose distinct visual indicators", () => {
+  assert.equal(getInputModeIndicator("auto", "shell", "shell"), "automatic");
+  assert.equal(getInputModeIndicator("auto", "shell", "agent"), "inactive");
+  assert.equal(getInputModeIndicator("agent", "agent", "agent"), "fixed");
+  assert.equal(getInputModeIndicator("shell", "shell", "shell"), "fixed");
+});
+
+test("click and Ctrl+Shift+I semantics toggle only the requested fixed mode", () => {
+  assert.equal(toggleFixedInputMode("auto", "agent"), "agent");
+  assert.equal(toggleFixedInputMode("shell", "agent"), "agent");
+  assert.equal(toggleFixedInputMode("agent", "agent"), "auto");
+  assert.equal(toggleFixedInputMode("auto", "shell"), "shell");
+  assert.equal(toggleFixedInputMode("shell", "shell"), "auto");
+  assert.equal(toggleFixedInputMode("auto", "agent", false), "auto");
+  assert.equal(toggleFixedInputMode("shell", "agent", false), "shell");
+});
+
+test("shell prompts preserve a valid fixed Agent target", () => {
+  assert.equal(resolvePromptInputTarget("agent", true), "agent");
+  assert.equal(resolvePromptInputTarget("agent", false), "shell");
+  assert.equal(resolvePromptInputTarget("auto", true), "shell");
+  assert.equal(resolvePromptInputTarget("shell", true), "shell");
 });
 
 test("empty automatic draft keeps the last semantic target", () => {
@@ -98,7 +113,7 @@ test("manual mode and unavailable Agent override the previous display target", (
       {
         text: "",
         agentAvailable: true,
-        manualOverride: "shell",
+        routingMode: "shell",
       },
       "agent"
     ),

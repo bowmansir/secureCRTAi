@@ -7,12 +7,14 @@ use anyhow::{anyhow, Context};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 
-const SERVICE: &str = "com.termai.app";
+// 保留旧服务名才能解密升级前已经保存的会话密码和 Provider API Key。
+const LEGACY_COMPAT_SERVICE: &str = "com.termai.app";
 const MASTER_KEY_USER: &str = "master-key";
 const NONCE_LEN: usize = 12;
 
 fn master_key() -> anyhow::Result<Key<Aes256Gcm>> {
-    let entry = keyring::Entry::new(SERVICE, MASTER_KEY_USER).context("打开系统凭据管理器失败")?;
+    let entry = keyring::Entry::new(LEGACY_COMPAT_SERVICE, MASTER_KEY_USER)
+        .context("打开系统凭据管理器失败")?;
     let key_bytes: [u8; 32] = match entry.get_password() {
         Ok(b64) => B64
             .decode(b64)?

@@ -14,7 +14,12 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
 const PBKDF2_ITERS: u32 = 200_000;
-const MAGIC: &str = "termai-export";
+const MAGIC: &str = "termexa-export";
+const LEGACY_MAGIC: &str = "termai-export";
+
+fn is_supported_magic(value: &str) -> bool {
+    value == MAGIC || value == LEGACY_MAGIC
+}
 
 #[derive(Serialize, Deserialize)]
 struct ExportFile {
@@ -147,9 +152,9 @@ pub fn export(store: &Store, path: &str, passphrase: &str) -> anyhow::Result<()>
 /// 返回 (导入会话数, 导入 Provider 数)
 pub fn import(store: &Store, path: &str, passphrase: &str) -> anyhow::Result<(usize, usize)> {
     let raw = std::fs::read_to_string(path).with_context(|| format!("读取文件失败: {path}"))?;
-    let file: ExportFile = serde_json::from_str(&raw).context("不是有效的 TermAI 导出文件")?;
-    if file.magic != MAGIC {
-        return Err(anyhow!("不是有效的 TermAI 导出文件"));
+    let file: ExportFile = serde_json::from_str(&raw).context("不是有效的 Termexa 导出文件")?;
+    if !is_supported_magic(&file.magic) {
+        return Err(anyhow!("不是有效的 Termexa 导出文件"));
     }
     let salt = B64.decode(&file.salt)?;
     let nonce = B64.decode(&file.nonce)?;
@@ -190,4 +195,16 @@ pub fn import(store: &Store, path: &str, passphrase: &str) -> anyhow::Result<(us
         let _ = store.set_active_provider(&active);
     }
     Ok((n_sessions, n_providers))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_supported_magic;
+
+    #[test]
+    fn current_and_legacy_export_brands_are_supported() {
+        assert!(is_supported_magic("termexa-export"));
+        assert!(is_supported_magic("termai-export"));
+        assert!(!is_supported_magic("unknown-export"));
+    }
 }

@@ -31,7 +31,7 @@ test("surface state starts isolated with conservative input defaults", () => {
   assert.deepEqual(first, {
     surfaceId: "terminal-1",
     inputTarget: "shell",
-    manualOverride: null,
+    routingMode: "auto",
     executionPolicy: "safe-auto",
     contextPolicy: "recent",
     contextAttachments: [],
@@ -79,8 +79,8 @@ test("control and input decisions stay scoped to their surface", () => {
   const first = reduceTerminalSurface(
     reduceTerminalSurface(
       reduceTerminalSurface(createTerminalSurfaceState("terminal-1"), {
-        type: "set-manual-override",
-        target: "agent",
+        type: "set-routing-mode",
+        mode: "agent",
       }),
       { type: "set-input-target", target: "agent" }
     ),
@@ -88,10 +88,10 @@ test("control and input decisions stay scoped to their surface", () => {
   );
   const second = createTerminalSurfaceState("terminal-2");
 
-  assert.equal(first.manualOverride, "agent");
+  assert.equal(first.routingMode, "agent");
   assert.equal(first.inputTarget, "agent");
   assert.equal(first.control, "executing");
-  assert.equal(second.manualOverride, null);
+  assert.equal(second.routingMode, "auto");
   assert.equal(second.inputTarget, "shell");
   assert.equal(second.control, "idle");
 });
@@ -136,8 +136,8 @@ test("clear removes timeline data and returns control to the user", () => {
   state = reduceTerminalSurface(state, { type: "set-control", control: "streaming" });
   state = reduceTerminalSurface(state, { type: "set-draft", draft: "pending request" });
   state = reduceTerminalSurface(state, {
-    type: "set-manual-override",
-    target: "agent",
+    type: "set-routing-mode",
+    mode: "agent",
   });
   state = reduceTerminalSurface(state, {
     type: "set-input-target",
@@ -167,18 +167,18 @@ test("clear removes timeline data and returns control to the user", () => {
   assert.deepEqual(state.contextAttachments, []);
   assert.equal(state.control, "idle");
   assert.equal(state.draft, "");
-  assert.equal(state.inputTarget, "shell");
-  assert.equal(state.manualOverride, null);
+  assert.equal(state.inputTarget, "agent");
+  assert.equal(state.routingMode, "agent");
   assert.equal(state.contextPolicy, "recent");
   assert.equal(state.conversationId, undefined);
   assert.equal(state.runtimeId, undefined);
 });
 
-test("clear resets empty manual mode and context state instead of returning early", () => {
+test("clear preserves fixed routing mode while resetting context state", () => {
   let state = createTerminalSurfaceState("terminal-1");
   state = reduceTerminalSurface(state, {
-    type: "set-manual-override",
-    target: "agent",
+    type: "set-routing-mode",
+    mode: "agent",
   });
   state = reduceTerminalSurface(state, {
     type: "set-input-target",
@@ -191,8 +191,8 @@ test("clear resets empty manual mode and context state instead of returning earl
 
   state = reduceTerminalSurface(state, { type: "clear" });
 
-  assert.equal(state.inputTarget, "shell");
-  assert.equal(state.manualOverride, null);
+  assert.equal(state.inputTarget, "agent");
+  assert.equal(state.routingMode, "agent");
   assert.equal(state.contextPolicy, "recent");
 });
 

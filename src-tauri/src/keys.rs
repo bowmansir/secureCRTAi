@@ -173,8 +173,8 @@ pub async fn deploy(
     let script = format!(
         "set -e; mkdir -p ~/.ssh; chmod 700 ~/.ssh; touch ~/.ssh/authorized_keys; \
          chmod 600 ~/.ssh/authorized_keys; \
-         if grep -qF '{escaped}' ~/.ssh/authorized_keys; then echo TERMAI_EXISTS; \
-         else echo '{escaped}' >> ~/.ssh/authorized_keys; echo TERMAI_ADDED; fi"
+         if grep -qF '{escaped}' ~/.ssh/authorized_keys; then echo TERMEXA_EXISTS; \
+         else echo '{escaped}' >> ~/.ssh/authorized_keys; echo TERMEXA_ADDED; fi"
     );
     let (code, out) = exec_once(&handle, &script).await?;
     let _ = handle
@@ -191,7 +191,7 @@ pub async fn deploy(
             }
         );
     }
-    Ok(if out.contains("TERMAI_EXISTS") {
+    Ok(if out.contains("TERMEXA_EXISTS") {
         "公钥已存在于 authorized_keys，无需重复部署".to_string()
     } else {
         "公钥已成功部署到远端 authorized_keys".to_string()
@@ -210,7 +210,7 @@ mod tests {
             .expect("system clock")
             .as_nanos();
         let dir = std::env::temp_dir().join(format!(
-            "termai-key-import-{label}-{}-{now}",
+            "termexa-key-import-{label}-{}-{now}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&dir);

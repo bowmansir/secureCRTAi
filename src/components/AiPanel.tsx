@@ -44,7 +44,12 @@ interface Props {
   insertCommand: (cmd: string) => void;
   openSettings: () => void;
   /** 外部触发的提问（右键菜单等），nonce 变化即发送 */
-  externalRequest?: { text: string; nonce: number; useAgent?: boolean } | null;
+  externalRequest?: {
+    text: string;
+    nonce: number;
+    useAgent?: boolean;
+    focusOnly?: boolean;
+  } | null;
   closeAgentRequest?: { keys: string[]; nonce: number } | null;
 }
 
@@ -236,7 +241,7 @@ export default function AiPanel({
   externalRequest,
   closeAgentRequest,
 }: Props) {
-  const { confirm } = useDialogs();
+  const { approval, prompt } = useDialogs();
   // 每个终端标签的普通对话与 Agent 对话分别存储，避免执行结果污染普通上下文。
   const [convos, setConvos] = useState<Record<string, UiChatMessage[]>>({});
   const convosRef = useRef<Record<string, UiChatMessage[]>>({});
@@ -258,6 +263,7 @@ export default function AiPanel({
   const streaming = streamingKeys.has(activeConversationKey);
   const agentBusy = agentBusyKeys.has(activeConversationKey);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
   const requestGate = useRef(new ScopedRequestGate());
   const aiRequestControllers = useRef<Record<string, AbortController>>({});
   const streamingAssistantIds = useRef<Record<string, string>>({});
@@ -267,6 +273,7 @@ export default function AiPanel({
   const agentStepLimits = useRef<Record<string, number>>({});
   const agentGoals = useRef<Record<string, string>>({});
   const agentExecutedCommands = useRef<Record<string, Set<string>>>({});
+  const agentApprovedCommands = useRef<Record<string, Set<string>>>({});
   const [agentLimitPauses, setAgentLimitPauses] = useState<Record<string, AgentLimitPause>>({});
   const agentLimitPausesRef = useRef<Record<string, AgentLimitPause>>({});
   const pendingAgentInstructions = useRef<Record<string, string[]>>({});
@@ -389,6 +396,7 @@ export default function AiPanel({
     delete agentStepLimits.current[key];
     delete agentGoals.current[key];
     delete agentExecutedCommands.current[key];
+    delete agentApprovedCommands.current[key];
     clearPendingAgentInstructions(key);
     if (agentLimitPausesRef.current[key]) {
       updateAgentLimitMessage(key, "ended");
@@ -431,6 +439,7 @@ export default function AiPanel({
         delete agentAutoSteps.current[key];
         delete agentStepLimits.current[key];
         delete agentExecutedCommands.current[key];
+        delete agentApprovedCommands.current[key];
         delete pendingAgentInstructions.current[key];
         delete streamingAssistantIds.current[key];
         delete activeExecMessageIds.current[key];
@@ -750,6 +759,11 @@ export default function AiPanel({
   useEffect(() => {
     if (externalRequest && externalRequest.nonce !== lastNonce.current && hasProvider) {
       lastNonce.current = externalRequest.nonce;
+      if (externalRequest.focusOnly) {
+        setAgentModeFor(conversationKey, false);
+        window.setTimeout(() => inputRef.current?.focus(), 0);
+        return;
+      }
       const useAgent = Boolean(externalRequest.useAgent && activeSessionId);
       if (useAgent) {
         setAgentModeFor(conversationKey, true);
@@ -931,15 +945,15 @@ export default function AiPanel({
           .join(" ");
       };
       for (const action of actions) {
-        const prepared = prepareAgentCommand(action.command);
-        const commandToRun = prepared.command;
-        const actionToRun: ShellExecuteAction = {
+        let prepared = prepareAgentCommand(action.command);
+        let commandToRun = prepared.command;
+        let actionToRun: ShellExecuteAction = {
           ...action,
           surfaceId,
           sessionId,
           command: commandToRun,
         };
-        const signature = normalizeAgentCommand(commandToRun);
+        let signature = normalizeAgentCommand(commandToRun);
         if (executedCommands.has(signature)) {
           results.push({
             command: commandToRun,
@@ -957,31 +971,57 @@ export default function AiPanel({
         }
         try {
           const runtimeKey = getAiPanelRuntimeKey(key);
-          let outcome = await agentChannels.execute(actionToRun, { runtimeKey });
-          if (outcome.status === "approval-required") {
-            const ok = await confirm({
-              title: "Agent 高风险命令确认",
-              message: `Agent 准备执行：\n\n${commandToRun}\n\n风险：${outcome.risk.reason}\n\n确认让它执行吗？`,
-              danger: true,
-              okText: "确认执行",
+          const approvedCommands =
+            agentApprovedCommands.current[key] ?? new Set<string>();
+          agentApprovedCommands.current[key] = approvedCommands;
+          const getApprovalKey = () =>
+            `${actionToRun.cwd ?? ""}\0${actionToRun.command.trim()}`;
+          let isApproved = approvedCommands.has(getApprovalKey());
+          let outcome = await agentChannels.execute(actionToRun, {
+            approved: isApproved,
+            runtimeKey,
+          });
+          while (outcome.status === "approval-required") {
+            const choice = await approval({
+              title: "Agent 命令确认",
+              command: commandToRun,
+              riskLevel: outcome.risk.riskLevel,
+              reason: outcome.risk.reason,
             });
-            if (!ok) {
+            if (choice === "reject") {
               rejected = true;
               results.push({
                 command: commandToRun,
-                note: "用户取消了高风险命令，本批次后续命令未执行。",
+                note: "用户拒绝了需确认命令，本批次后续命令未执行。",
                 exitCode: null,
-                output: "已取消执行。",
+                output: "已拒绝执行。",
                 outputChars: 0,
                 truncated: false,
               });
               break;
             }
+            if (choice === "modify") {
+              const modified = await prompt({
+                title: "修改 Agent 命令",
+                defaultValue: commandToRun,
+                note: "修改后的命令会重新经过风险检查。",
+              });
+              if (!modified?.trim()) continue;
+              prepared = prepareAgentCommand(modified.trim());
+              commandToRun = prepared.command;
+              actionToRun = { ...actionToRun, command: commandToRun };
+              signature = normalizeAgentCommand(commandToRun);
+              isApproved = approvedCommands.has(getApprovalKey());
+            } else {
+              isApproved = true;
+              approvedCommands.add(getApprovalKey());
+            }
             outcome = await agentChannels.execute(actionToRun, {
-              approved: true,
+              approved: isApproved,
               runtimeKey,
             });
           }
+          if (rejected) break;
           if (outcome.status === "cancelled") {
             if (runSeq === agentRunSeq.current[key]) {
               const output = "Agent 命令已停止。";
@@ -1050,7 +1090,7 @@ export default function AiPanel({
       }
       const disposition = getAgentBatchDisposition(results, rejected);
       const feedback = rejected
-        ? "用户拒绝了高风险命令，当前 Agent 任务已停止。"
+        ? "用户拒绝了需确认命令，当前 Agent 任务已停止。"
         : buildAgentFeedback(agentGoals.current[key], results);
       const detail = buildAgentExecDetail(results);
       if (runSeq !== agentRunSeq.current[key]) return;
@@ -1236,6 +1276,7 @@ export default function AiPanel({
       </div>
       <div className="ai-input-box">
         <textarea
+          ref={inputRef}
           className="ai-input"
           rows={2}
           placeholder={

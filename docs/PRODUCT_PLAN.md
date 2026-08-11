@@ -1,4 +1,4 @@
-# TermAI — 产品规划（对标 SecureCRT 的现代化 AI 终端）
+# Termexa — 产品规划（对标 SecureCRT 的现代化 AI 终端）
 
 > 定位：一款现代化、开源友好、AI 原生的远程终端管理工具。
 > 对标 SecureCRT，目标是在「连接管理 + 终端体验 + 智能辅助」三个维度全面超越。

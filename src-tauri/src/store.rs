@@ -92,14 +92,31 @@ pub struct Store {
 
 impl Store {
     pub fn load() -> anyhow::Result<Self> {
-        let dir = dirs::config_dir()
-            .context("无法定位配置目录")?
-            .join("TermAI");
+        let config_root = dirs::config_dir().context("无法定位配置目录")?;
+        Self::load_from_config_root(&config_root)
+    }
+
+    fn load_from_config_root(config_root: &std::path::Path) -> anyhow::Result<Self> {
+        let dir = config_root.join("Termexa");
         std::fs::create_dir_all(&dir)?;
         let path = dir.join("store.json");
-        let data = match std::fs::read_to_string(&path) {
-            Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
-            Err(_) => StoreFile::default(),
+        let data = if path.exists() {
+            std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|content| serde_json::from_str(&content).ok())
+                .unwrap_or_default()
+        } else {
+            let legacy_path = config_root.join("TermAI").join("store.json");
+            match std::fs::read_to_string(&legacy_path) {
+                Ok(content) => match serde_json::from_str(&content) {
+                    Ok(data) => {
+                        std::fs::write(&path, content).context("迁移旧版配置到 Termexa 失败")?;
+                        data
+                    }
+                    Err(_) => StoreFile::default(),
+                },
+                Err(_) => StoreFile::default(),
+            }
         };
         Ok(Self {
             path,
@@ -332,7 +349,7 @@ mod tests {
     use uuid::Uuid;
 
     fn test_store() -> (Store, PathBuf) {
-        let path = std::env::temp_dir().join(format!("termai-store-{}.json", Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!("termexa-store-{}.json", Uuid::new_v4()));
         (
             Store {
                 path: path.clone(),
@@ -389,5 +406,45 @@ mod tests {
         assert!(store.set_color_theme("unknown").is_err());
         assert!(store.set_background_theme(Some(String::new())).is_err());
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn legacy_brand_config_is_migrated_without_losing_preferences() {
+        let root = std::env::temp_dir().join(format!("termexa-migrate-{}", Uuid::new_v4()));
+        let legacy_dir = root.join("TermAI");
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        std::fs::write(
+            legacy_dir.join("store.json"),
+            r#"{"groups":["production"],"themePreferences":{"colorTheme":"midnight","backgroundThemeId":"theme-1"}}"#,
+        )
+        .unwrap();
+
+        let store = Store::load_from_config_root(&root).unwrap();
+        assert_eq!(store.data.lock().groups, vec!["production"]);
+        assert_eq!(
+            store
+                .theme_preferences()
+                .and_then(|preferences| preferences.background_theme_id),
+            Some("theme-1".to_string())
+        );
+        assert!(root.join("Termexa").join("store.json").exists());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn current_brand_config_is_never_overwritten_by_legacy_data() {
+        let root = std::env::temp_dir().join(format!("termexa-current-{}", Uuid::new_v4()));
+        let legacy_dir = root.join("TermAI");
+        let current_dir = root.join("Termexa");
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        std::fs::create_dir_all(&current_dir).unwrap();
+        std::fs::write(legacy_dir.join("store.json"), r#"{"groups":["legacy"]}"#).unwrap();
+        std::fs::write(current_dir.join("store.json"), r#"{"groups":["current"]}"#).unwrap();
+
+        let store = Store::load_from_config_root(&root).unwrap();
+        assert_eq!(store.data.lock().groups, vec!["current"]);
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

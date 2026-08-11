@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import * as api from "../api";
 import { useDialogs } from "./Dialogs";
+import { useDesktopUpdate } from "../update/DesktopUpdateContext";
 import Icon from "./Icons";
 import type {
   AiConfigView,
@@ -105,6 +106,7 @@ export default function SettingsDialog({
   onImported,
 }: Props) {
   const { prompt: dialogPrompt } = useDialogs();
+  const desktopUpdate = useDesktopUpdate();
   const [ioMessage, setIoMessage] = useState("");
   const [config, setConfig] = useState<AiConfigView | null>(null);
   const [editing, setEditing] = useState<ProviderView | null>(null);
@@ -212,7 +214,7 @@ export default function SettingsDialog({
 
   const doExport = async () => {
     const path = await saveDialog({
-      defaultPath: "termai-config.json",
+      defaultPath: "termexa-config.json",
       title: "导出配置（含会话与 AI 设置）",
     });
     if (!path) return;
@@ -232,7 +234,7 @@ export default function SettingsDialog({
   };
 
   const doImport = async () => {
-    const picked = await openDialog({ multiple: false, title: "选择 TermAI 配置文件" });
+    const picked = await openDialog({ multiple: false, title: "选择 Termexa 配置文件" });
     if (!picked) return;
     const pass = await dialogPrompt({ title: "输入导出口令", password: true });
     if (!pass) return;
@@ -286,7 +288,7 @@ export default function SettingsDialog({
   return (
     <div className="modal-mask" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
       <div className="modal wide">
-        <h3>AI Provider 设置</h3>
+        <h3>Termexa 设置</h3>
         {!showForm && (
           <>
             <div className="settings-section">
@@ -387,6 +389,52 @@ export default function SettingsDialog({
                   <div className="custom-theme-empty">暂无图片主题</div>
                 )}
               {themeMessage && <div className="form-error">{themeMessage}</div>}
+            </div>
+            <div className="settings-section">
+              <div className="settings-section-title">软件更新</div>
+              <div className="desktop-update-settings">
+                <div>
+                  <strong>
+                    {desktopUpdate.state.currentVersion
+                      ? `Termexa v${desktopUpdate.state.currentVersion}`
+                      : "Termexa 开发模式"}
+                  </strong>
+                  <small>
+                    {!desktopUpdate.runtimeAvailable
+                      ? "浏览器开发模式不会连接更新服务"
+                      : desktopUpdate.state.phase === "checking"
+                        ? "正在检查新版本…"
+                        : desktopUpdate.state.phase === "upToDate"
+                          ? "当前已是最新版本"
+                          : desktopUpdate.state.phase === "available"
+                            ? `可更新到 v${desktopUpdate.state.targetVersion}`
+                            : desktopUpdate.state.phase === "error"
+                              ? "检查失败，请稍后重试"
+                              : "通过 Mya 安全检查并安装已签名版本"}
+                  </small>
+                </div>
+                <button
+                  className="btn"
+                  type="button"
+                  disabled={
+                    !desktopUpdate.runtimeAvailable ||
+                    desktopUpdate.state.phase === "checking" ||
+                    desktopUpdate.state.phase === "downloading" ||
+                    desktopUpdate.state.phase === "installing"
+                  }
+                  onClick={() => void desktopUpdate.checkNow()}
+                >
+                  {desktopUpdate.state.phase === "checking" ? "检查中…" : "检查更新"}
+                </button>
+              </div>
+              <label className="desktop-update-toggle">
+                <input
+                  type="checkbox"
+                  checked={desktopUpdate.automaticChecks}
+                  onChange={(event) => desktopUpdate.setAutomaticChecks(event.target.checked)}
+                />
+                <span>启动后在后台自动检查更新</span>
+              </label>
             </div>
             <div className="settings-section-title">AI Provider</div>
             <div className="provider-list">

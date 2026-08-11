@@ -1,8 +1,8 @@
-# TermAI Design System
+# Termexa Design System
 
 ## 设计方向
 
-TermAI 是高频远程运维工具。界面应安静、紧凑、可扫描，重点突出连接状态、
+Termexa 是高频远程运维工具。界面应安静、紧凑、可扫描，重点突出连接状态、
 命令结果和 Agent 当前动作。默认模式下 Agent 是终端时间线的一部分；用户显式点击顶部
 AI 时进入独立的传统 AI 面板模式。
 

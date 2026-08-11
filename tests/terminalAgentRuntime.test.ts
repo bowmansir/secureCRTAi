@@ -31,8 +31,8 @@ function createHarness(
   runCommand: (
     command: string
   ) =>
-    | { output: string; exitCode: number }
-    | Promise<{ output: string; exitCode: number }> = async (command) => ({
+    | { output: string; exitCode: number | null }
+    | Promise<{ output: string; exitCode: number | null }> = async (command) => ({
     output: `output:${command}`,
     exitCode: 0,
   })
@@ -84,6 +84,45 @@ function createHarness(
   });
   return { runtime, surfaces, calls };
 }
+
+test("unknown command completion stops instead of replanning or reporting success", async () => {
+  const harness = createHarness(
+    [
+      [
+        "执行一次检查。",
+        "```termexa-actions",
+        JSON.stringify({
+          actions: [{ type: "shell.execute", command: "uptime" }],
+        }),
+        "```",
+      ].join("\n"),
+      "不应自动进入第二轮",
+    ],
+    undefined,
+    async () => ({ output: "执行状态未知", exitCode: null })
+  );
+  harness.surfaces.set("surface-a", createTerminalSurfaceState("surface-a"));
+
+  await harness.runtime.submit({
+    surfaceId: "surface-a",
+    sessionId: "session-a",
+    prompt: "检查服务",
+  });
+  await waitForIdle(harness.runtime, "surface-a");
+
+  assert.equal(harness.calls.chat.length, 1);
+  const execution = harness.surfaces
+    .get("surface-a")!
+    .blocks.find((block) => block.kind === "agent-execution");
+  assert.equal(
+    execution?.kind === "agent-execution" ? execution.status : undefined,
+    "error"
+  );
+  assert.equal(
+    execution?.kind === "agent-execution" ? execution.exitCode : undefined,
+    null
+  );
+});
 
 async function waitForPause(
   runtime: TerminalAgentRuntime,
@@ -343,7 +382,7 @@ test("executes typed read, wait and shell actions in one ordered batch", async (
   const harness = createHarness([
     [
       "读取已有结果，短暂等待后检查服务。",
-      "```termai-actions",
+      "```termexa-actions",
       JSON.stringify({
         actions: [
           { type: "terminal.readBlocks", blockIds: ["existing-shell"] },
@@ -401,11 +440,262 @@ test("executes typed read, wait and shell actions in one ordered batch", async (
   );
 });
 
+test("bounds persistent Agent logs and waits without requesting risk approval", async () => {
+  let approvalCount = 0;
+  const harness = createHarness(
+    [
+      [
+        "采样 PM2 日志。",
+        "```termexa-actions",
+        JSON.stringify({
+          actions: [
+            { type: "shell.execute", command: "pm2 log 0" },
+            { type: "shell.execute", command: "sleep 30" },
+          ],
+        }),
+        "```",
+      ].join("\n"),
+      "任务完成：日志采样结束。",
+    ],
+    async () => {
+      approvalCount += 1;
+      return { decision: "execute" };
+    }
+  );
+  harness.surfaces.set("surface-a", createTerminalSurfaceState("surface-a"));
+
+  await harness.runtime.submit({
+    surfaceId: "surface-a",
+    sessionId: "session-a",
+    prompt: "查看 PM2 日志",
+  });
+  await waitForIdle(harness.runtime, "surface-a");
+
+  assert.deepEqual(harness.calls.run, [
+    {
+      channelId: "channel-1",
+      command: "timeout 5s pm2 log 0 || [ $? -eq 124 ]",
+    },
+    {
+      channelId: "channel-1",
+      command: "timeout 5s sleep 30 || [ $? -eq 124 ]",
+    },
+  ]);
+  assert.equal(approvalCount, 0);
+});
+
+test("executes read-only HTTP probes and Redis scans without approval", async () => {
+  let approvalCount = 0;
+  const curl =
+    "timeout 8s curl -sI -m 6 http://es-cn-4591gc2fx0001549q.elasticsearch.aliyuncs.com:9200 2>&1 | head -10";
+  const search =
+    "curl -s -m 8 'http://127.0.0.1:8200/plume_log_run_2021110515/_search?size=5&pretty' -H 'Content-Type: application/json' -d '{\"query\":{\"term\":{\"appName\":\"work\"}},\"sort\":[{\"dtTime\":{\"order\":\"desc\"}}],\"_source\":[]}'";
+  const redis =
+    "which redis-cli && redis-cli -h 172.19.12.36 -p 6379 --scan --pattern 'plumelog*' 2>/dev/null | head -40 || echo 'redis-cli not available or no auth'";
+  const harness = createHarness(
+    [
+      [
+        "检查 HTTP 与 Redis 状态。",
+        "```termexa-actions",
+        JSON.stringify({
+          actions: [
+            { type: "shell.execute", command: curl },
+            { type: "shell.execute", command: search },
+            { type: "shell.execute", command: redis },
+          ],
+        }),
+        "```",
+      ].join("\n"),
+      "任务完成：只读探测结束。",
+    ],
+    async () => {
+      approvalCount += 1;
+      return { decision: "execute" };
+    }
+  );
+  harness.surfaces.set("surface-a", createTerminalSurfaceState("surface-a"));
+
+  await harness.runtime.submit({
+    surfaceId: "surface-a",
+    sessionId: "session-a",
+    prompt: "检查 Elasticsearch 和 Redis",
+  });
+  await waitForIdle(harness.runtime, "surface-a");
+
+  assert.deepEqual(
+    harness.calls.run.map((call) => call.command),
+    [curl, search, redis]
+  );
+  assert.equal(approvalCount, 0);
+});
+
+test("executes read-only awk log filtering without approval", async () => {
+  let approvalCount = 0;
+  const command =
+    "echo '=== 200048 17:41:50 之后所有日志 ==='; awk '$0 >= \"2026-07-31 17:41:50\"' /opt/weworkmedia/logs/wework-media.log | grep -E '200048|type=5' | tail -80";
+  const harness = createHarness(
+    [
+      [
+        "查询指定时间后的业务日志。",
+        "```termexa-actions",
+        JSON.stringify({
+          actions: [{ type: "shell.execute", command }],
+        }),
+        "```",
+      ].join("\n"),
+      "任务完成：日志查询结束。",
+    ],
+    async () => {
+      approvalCount += 1;
+      return { decision: "execute" };
+    }
+  );
+  harness.surfaces.set("surface-a", createTerminalSurfaceState("surface-a"));
+
+  await harness.runtime.submit({
+    surfaceId: "surface-a",
+    sessionId: "session-a",
+    prompt: "查看 17:41:50 后编号 200048 的日志",
+  });
+  await waitForIdle(harness.runtime, "surface-a");
+
+  assert.equal(approvalCount, 0);
+  assert.deepEqual(
+    harness.calls.run.map((call) => call.command),
+    [command]
+  );
+});
+
+test("executes read-only command discovery loops without approval", async () => {
+  let approvalCount = 0;
+  const command =
+    'for c in virt-customize guestfish virt-resize virt-filesystems; do command -v $c >/dev/null 2>&1 && echo "FOUND:$c" || echo "MISSING:$c"; done';
+  const harness = createHarness(
+    [
+      [
+        "检查虚拟化工具是否存在。",
+        "```termexa-actions",
+        JSON.stringify({
+          actions: [{ type: "shell.execute", command }],
+        }),
+        "```",
+      ].join("\n"),
+      "任务完成：工具检查结束。",
+    ],
+    async () => {
+      approvalCount += 1;
+      return { decision: "execute" };
+    }
+  );
+  harness.surfaces.set("surface-a", createTerminalSurfaceState("surface-a"));
+
+  await harness.runtime.submit({
+    surfaceId: "surface-a",
+    sessionId: "session-a",
+    prompt: "检查虚拟化工具",
+  });
+  await waitForIdle(harness.runtime, "surface-a");
+
+  assert.equal(approvalCount, 0);
+  assert.deepEqual(
+    harness.calls.run.map((call) => call.command),
+    [command]
+  );
+});
+
+test("executes query-shaped unknown commands without approval", async () => {
+  let approvalCount = 0;
+  const commands = [
+    "virt-host-validate",
+    "qemu-img info /var/lib/libvirt/images/demo.qcow2",
+    "customctl status --json",
+  ];
+  const harness = createHarness(
+    [
+      [
+        "执行只读环境诊断。",
+        "```termexa-actions",
+        JSON.stringify({
+          actions: commands.map((command) => ({
+            type: "shell.execute",
+            command,
+          })),
+        }),
+        "```",
+      ].join("\n"),
+      "任务完成：只读环境诊断结束。",
+    ],
+    async () => {
+      approvalCount += 1;
+      return { decision: "execute" };
+    }
+  );
+  harness.surfaces.set("surface-a", createTerminalSurfaceState("surface-a"));
+
+  await harness.runtime.submit({
+    surfaceId: "surface-a",
+    sessionId: "session-a",
+    prompt: "检查虚拟化环境",
+  });
+  await waitForIdle(harness.runtime, "surface-a");
+
+  assert.equal(approvalCount, 0);
+  assert.deepEqual(
+    harness.calls.run.map((call) => call.command),
+    commands
+  );
+});
+
+test("rejects placeholder query fragments before opening an execution channel", async () => {
+  let approvalCount = 0;
+  const command =
+    "appName=<业务线>&env=<环境>&className=<类名>&logLevel=<级别>&time=<毫秒时间戳>";
+  const harness = createHarness(
+    [
+      [
+        "查询日志。",
+        "```termexa-actions",
+        JSON.stringify({
+          actions: [{ type: "shell.execute", command }],
+        }),
+        "```",
+      ].join("\n"),
+      "任务完成：原动作只是查询参数模板，未执行。",
+    ],
+    async () => {
+      approvalCount += 1;
+      return { decision: "execute" };
+    }
+  );
+  harness.surfaces.set("surface-a", createTerminalSurfaceState("surface-a"));
+
+  await harness.runtime.submit({
+    surfaceId: "surface-a",
+    sessionId: "session-a",
+    prompt: "查询业务日志",
+  });
+  await waitForIdle(harness.runtime, "surface-a");
+
+  assert.equal(approvalCount, 0);
+  assert.deepEqual(harness.calls.open, []);
+  assert.deepEqual(harness.calls.run, []);
+  const state = harness.surfaces.get("surface-a")!;
+  const execution = state.blocks.find((block) => block.kind === "agent-execution");
+  assert.equal(
+    execution?.kind === "agent-execution" ? execution.status : undefined,
+    "error"
+  );
+  assert.match(
+    execution?.kind === "agent-execution" ? execution.output : "",
+    /缺少可执行命令/
+  );
+});
+
 test("terminal.readBlocks redacts secrets before returning output to the model", async () => {
   const harness = createHarness([
     [
       "读取已有结果。",
-      "```termai-actions",
+      "```termexa-actions",
       JSON.stringify({
         actions: [
           { type: "terminal.readBlocks", blockIds: ["secret-shell"] },
@@ -446,7 +736,7 @@ test("terminal.readBlocks redacts secrets before returning output to the model",
 test("malformed typed actions fail closed and never execute markdown fallback", async () => {
   const malformedResponse = [
       "准备执行。",
-      "```termai-actions",
+      "```termexa-actions",
       '{"actions":[{"type":"shell.execute","command":42}]}',
       "```",
       "```sh",
@@ -476,16 +766,60 @@ test("malformed typed actions fail closed and never execute markdown fallback", 
   );
 });
 
+test("timestamped log output is blocked before approval or execution", async () => {
+  const transcript = [
+    '\x1b[90m17:19:05.551\x1b[0m  手机200048从task表原子取到任务： {"type":5,"slave":1,"subject":""}',
+    "17:19:05.683  编号200048接收到确认的消息",
+    "17:19:28.675  接收的消息 {slave=1, subject=, err_msg=企微开启失败}",
+  ].join("\n");
+  const response = [
+    "继续查看日志。",
+    "```termexa-actions",
+    JSON.stringify({
+      actions: [{ type: "shell.execute", command: transcript }],
+    }),
+    "```",
+  ].join("\n");
+  const harness = createHarness([response], async () => {
+    throw new Error("无效动作不应进入审批");
+  });
+  harness.surfaces.set("surface-a", createTerminalSurfaceState("surface-a"));
+
+  await harness.runtime.submit({
+    surfaceId: "surface-a",
+    sessionId: "session-a",
+    prompt: "继续排查这些日志",
+  });
+  await waitForIdle(harness.runtime, "surface-a");
+
+  assert.equal(harness.calls.chat.length, 2);
+  assert.deepEqual(harness.calls.open, []);
+  assert.deepEqual(harness.calls.run, []);
+  const execution = harness.surfaces
+    .get("surface-a")!
+    .blocks.find((block) => block.kind === "agent-execution");
+  assert.equal(
+    execution?.kind === "agent-execution" ? execution.status : undefined,
+    "error"
+  );
+  assert.match(
+    execution?.kind === "agent-execution"
+      ? execution.output
+      : "",
+    /日志|终端输出|缺少可执行命令/
+  );
+});
+
 test("malformed typed actions are repaired once before execution", async () => {
   const harness = createHarness([
     [
       "准备检查运行时间。",
-      "```termai-actions",
+      "```termexa-actions",
       '{"actions":[{"type":"shell.execute","cmd":"uptime"}]}',
       "```",
     ].join("\n"),
     [
-      "```termai-actions",
+      "```termexa-actions",
       '{"actions":[{"type":"shell.execute","command":"uptime"}]}',
       "```",
     ].join("\n"),
@@ -515,12 +849,12 @@ test("action repair cannot introduce a command absent from the original envelope
   const harness = createHarness([
     [
       "准备检查。",
-      "```termai-actions",
+      "```termexa-actions",
       '{"actions":[{"type":"shell.execute","command":42}]}',
       "```",
     ].join("\n"),
     [
-      "```termai-actions",
+      "```termexa-actions",
       '{"actions":[{"type":"shell.execute","command":"uptime"}]}',
       "```",
     ].join("\n"),
@@ -551,13 +885,13 @@ test("diagnostic output can drive replanning without authorizing embedded comman
     [
       [
         "先检查服务状态。",
-        "```termai-actions",
+        "```termexa-actions",
         '{"actions":[{"type":"shell.execute","command":"systemctl status nginx --no-pager"}]}',
         "```",
       ].join("\n"),
       [
         "端口被占用，继续定位监听进程。",
-        "```termai-actions",
+        "```termexa-actions",
         '{"actions":[{"type":"shell.execute","command":"ss -ltnp"}]}',
         "```",
       ].join("\n"),
@@ -611,7 +945,7 @@ test("an oversized typed plan executes the first bounded batch", async () => {
   const harness = createHarness([
     [
       "执行一轮只读诊断。",
-      "```termai-actions",
+      "```termexa-actions",
       JSON.stringify({ actions }),
       "```",
     ].join("\n"),
@@ -645,7 +979,7 @@ test("stopping a typed wait cancels the batch without running later actions", as
   const harness = createHarness([
     [
       "等待后检查。",
-      "```termai-actions",
+      "```termexa-actions",
       JSON.stringify({
         actions: [
           { type: "terminal.wait", durationMs: 30_000, reason: "等待部署完成" },
@@ -832,11 +1166,82 @@ test("approved dangerous action executes only after the approval decision", asyn
   ]);
 });
 
+test("an approved command is not requested again in the same runtime scope", async () => {
+  let approvals = 0;
+  const command = "systemctl restart nginx";
+  const response = `准备重启服务。\n\`\`\`sh\n${command}\n\`\`\``;
+  const harness = createHarness(
+    [response, "任务完成：服务已重启。", response, "任务完成：服务已重启。"],
+    async () => {
+      approvals += 1;
+      return { decision: "execute" };
+    }
+  );
+  harness.surfaces.set("surface-a", createTerminalSurfaceState("surface-a"));
+
+  await harness.runtime.submit({
+    surfaceId: "surface-a",
+    sessionId: "session-a",
+    prompt: "第一次重启 nginx",
+  });
+  await waitForIdle(harness.runtime, "surface-a");
+  await harness.runtime.submit({
+    surfaceId: "surface-a",
+    sessionId: "session-a",
+    prompt: "再次执行刚才允许的命令",
+  });
+  await waitForIdle(harness.runtime, "surface-a");
+
+  assert.equal(approvals, 1);
+  assert.deepEqual(
+    harness.calls.run.map((call) => call.command),
+    [command, command]
+  );
+});
+
+test("approval remains exact-command scoped and does not authorize another write", async () => {
+  let approvals = 0;
+  const first = "systemctl restart nginx";
+  const second = "systemctl restart redis";
+  const harness = createHarness(
+    [
+      `准备执行。\n\`\`\`sh\n${first}\n\`\`\``,
+      "任务完成：nginx 已重启。",
+      `准备执行。\n\`\`\`sh\n${second}\n\`\`\``,
+      "任务完成：redis 已重启。",
+    ],
+    async () => {
+      approvals += 1;
+      return { decision: "execute" };
+    }
+  );
+  harness.surfaces.set("surface-a", createTerminalSurfaceState("surface-a"));
+
+  await harness.runtime.submit({
+    surfaceId: "surface-a",
+    sessionId: "session-a",
+    prompt: "重启 nginx",
+  });
+  await waitForIdle(harness.runtime, "surface-a");
+  await harness.runtime.submit({
+    surfaceId: "surface-a",
+    sessionId: "session-a",
+    prompt: "重启 redis",
+  });
+  await waitForIdle(harness.runtime, "surface-a");
+
+  assert.equal(approvals, 2);
+  assert.deepEqual(
+    harness.calls.run.map((call) => call.command),
+    [first, second]
+  );
+});
+
 test("typed terminal interrupt stops the current surface channel", async () => {
   const harness = createHarness([
     [
       "先读取状态，再中断当前执行通道。",
-      "```termai-actions",
+      "```termexa-actions",
       JSON.stringify({
         actions: [
           { type: "shell.execute", command: "uptime" },

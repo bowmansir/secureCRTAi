@@ -12,6 +12,7 @@ import CommandPalette from "./components/CommandPalette";
 import type { CommandPaletteItem } from "./components/CommandPalette";
 import { ContextMenuProvider, SEPARATOR, useContextMenu } from "./components/ContextMenu";
 import { DialogProvider, useDialogs } from "./components/Dialogs";
+import DesktopUpdateDialog from "./components/DesktopUpdateDialog";
 import { checkDangerous } from "./dangerous";
 import Icon from "./components/Icons";
 import Resizer from "./components/Resizer";
@@ -31,6 +32,12 @@ import {
 import { createRemoteFileAttachment } from "./agent/contextAssembler";
 import { resolveAiPresentation } from "./agent/aiPresentation";
 import { MAX_CONTEXT_ATTACHMENTS } from "./agent/surfaceModel";
+import {
+  planCloseSplitPane,
+  type SplitDirection,
+  type SplitLayout,
+} from "./terminal/splitLayout";
+import { DesktopUpdateProvider } from "./update/DesktopUpdateContext";
 import type {
   HostHealthSummary,
   HostHealthView,
@@ -45,20 +52,17 @@ import "./App.css";
 
 const MAX_CONTEXT_CHARS = 8000;
 const MAX_OPEN_TABS = 20;
-type SplitDirection = "columns" | "rows";
-
-interface SplitLayout {
-  direction: SplitDirection;
-  panes: TabInfo[];
-}
 
 export default function App() {
   return (
     <ContextMenuProvider>
       <DialogProvider>
-        <TerminalSurfaceProvider>
-          <AppInner />
-        </TerminalSurfaceProvider>
+        <DesktopUpdateProvider>
+          <TerminalSurfaceProvider>
+            <AppInner />
+          </TerminalSurfaceProvider>
+          <DesktopUpdateDialog />
+        </DesktopUpdateProvider>
       </DialogProvider>
     </ContextMenuProvider>
   );
@@ -69,15 +73,23 @@ const clamp = (v: number, min: number, max: number) => Math.min(max, Math.max(mi
 // UI 偏好持久化（面板尺寸、AI 显隐）——纯前端，存 localStorage
 const loadPref = <T,>(key: string, fallback: T): T => {
   try {
-    const v = localStorage.getItem(`termai.${key}`);
-    return v === null ? fallback : (JSON.parse(v) as T);
+    const currentKey = `termexa.${key}`;
+    const legacyKey = `termai.${key}`;
+    const current = localStorage.getItem(currentKey);
+    const v = current ?? localStorage.getItem(legacyKey);
+    if (v === null) return fallback;
+    const parsed = JSON.parse(v) as T;
+    if (current === null) {
+      localStorage.setItem(currentKey, v);
+    }
+    return parsed;
   } catch {
     return fallback;
   }
 };
 const savePref = (key: string, value: unknown) => {
   try {
-    localStorage.setItem(`termai.${key}`, JSON.stringify(value));
+    localStorage.setItem(`termexa.${key}`, JSON.stringify(value));
   } catch {
     /* ignore */
   }
@@ -127,6 +139,8 @@ function AppInner() {
   const [tabs, setTabs] = useState<TabInfo[]>([]);
   const [activeTab, setActiveTab] = useState<string | null>(null);
   const [splitLayouts, setSplitLayouts] = useState<Record<string, SplitLayout>>({});
+  const splitLayoutsRef = useRef(splitLayouts);
+  splitLayoutsRef.current = splitLayouts;
   const [activePaneByTab, setActivePaneByTab] = useState<Record<string, string>>({});
   const [closeAgentRequest, setCloseAgentRequest] = useState<{ keys: string[]; nonce: number } | null>(null);
   const [terminalSizes, setTerminalSizes] = useState<Record<string, { cols: number; rows: number }>>({});
@@ -147,6 +161,7 @@ function AppInner() {
     text: string;
     nonce: number;
     useAgent?: boolean;
+    focusOnly?: boolean;
   } | null>(null);
 
   // 尺寸/显隐变化时持久化
@@ -175,6 +190,8 @@ function AppInner() {
           await api.themeSetColor(theme);
           await api.themeSetBackground(backgroundThemeId);
         }
+        localStorage.removeItem("termexa.theme");
+        localStorage.removeItem("termexa.backgroundThemeId");
         localStorage.removeItem("termai.theme");
         localStorage.removeItem("termai.backgroundThemeId");
       } catch (error) {
@@ -246,9 +263,20 @@ function AppInner() {
     setAiRequest({ text, nonce: Date.now(), useAgent: false });
   }, []);
 
+  const openCommandAssistant = useCallback(() => {
+    setAiVisible(true);
+    setAiRequest({
+      text: "",
+      nonce: Date.now(),
+      useAgent: false,
+      focusOnly: true,
+    });
+  }, []);
+
   // 每个标签页的最近输出（AI 上下文）与后端终端 id
   const outputBuffers = useRef(new Map<string, string>());
   const termIds = useRef(new Map<string, string>());
+  const retiredPaneIds = useRef(new Set<string>());
 
   const [transfers, setTransfers] = useState<TransferItem[]>([]);
   const runtimeTabs = useMemo(
@@ -638,20 +666,12 @@ function AppInner() {
     });
   };
 
-  const closeTabs = (ids: string[]) => {
-    const idSet = new Set(ids);
-    const cleanupIds = new Set(ids);
-    for (const id of ids) {
-      splitLayouts[id]?.panes.forEach((pane) => cleanupIds.add(pane.tabId));
-    }
-    setTabs((prev) => {
-      const next = prev.filter((t) => !idSet.has(t.tabId));
-      setActiveTab((cur) =>
-        cur && idSet.has(cur) ? next[next.length - 1]?.tabId ?? null : cur
-      );
-      return next;
-    });
+  const cleanupTerminalPanes = (ids: Iterable<string>) => {
+    const cleanupIds = [...new Set(ids)].filter(Boolean);
+    if (cleanupIds.length === 0) return;
     for (const id of cleanupIds) {
+      retiredPaneIds.current.add(id);
+      window.setTimeout(() => retiredPaneIds.current.delete(id), 30_000);
       outputBuffers.current.delete(id);
       termIds.current.delete(id);
       removeSurface(id);
@@ -668,6 +688,22 @@ function AppInner() {
       }
       return changed ? next : prev;
     });
+  };
+
+  const closeTabs = (ids: string[]) => {
+    const idSet = new Set(ids);
+    const cleanupIds = new Set(ids);
+    for (const id of ids) {
+      splitLayouts[id]?.panes.forEach((pane) => cleanupIds.add(pane.tabId));
+    }
+    setTabs((prev) => {
+      const next = prev.filter((t) => !idSet.has(t.tabId));
+      setActiveTab((cur) =>
+        cur && idSet.has(cur) ? next[next.length - 1]?.tabId ?? null : cur
+      );
+      return next;
+    });
+    cleanupTerminalPanes(cleanupIds);
     setSplitLayouts((prev) => {
       let changed = false;
       const next = { ...prev };
@@ -730,7 +766,7 @@ function AppInner() {
                 splitTerminalTab(t, "rows");
               },
             },
-            ...(splitLayouts[t.tabId]
+            ...((splitLayouts[t.tabId]?.panes.length ?? 0) > 1
               ? [
                   {
                     label: "关闭分屏",
@@ -758,7 +794,17 @@ function AppInner() {
   };
 
   const onStatus = useCallback((tabId: string, status: TabInfo["status"]) => {
-    setTabs((prev) => prev.map((t) => (t.tabId === tabId ? { ...t, status } : t)));
+    // termClose 可能在窗格移除后才返回 exit，不能让迟到事件覆盖接管窗格的状态。
+    if (retiredPaneIds.current.has(tabId)) return;
+    setTabs((prev) =>
+      prev.map((tab) => {
+        if (tab.tabId === tabId) return { ...tab, status };
+        const layout = splitLayoutsRef.current[tab.tabId];
+        return layout?.panes.length === 1 && layout.panes[0].tabId === tabId
+          ? { ...tab, status }
+          : tab;
+      })
+    );
     setSplitLayouts((prev) => {
       let changed = false;
       const next: Record<string, SplitLayout> = {};
@@ -946,37 +992,94 @@ function AppInner() {
     activatePane(parentTab.tabId, newPane.tabId);
   };
 
-  const closeSplitTab = (parentTabId: string) => {
+  const closeSplitPane = (parentTabId: string, paneId: string) => {
     const layout = splitLayouts[parentTabId];
-    if (!layout) return;
-    const cleanupIds = layout.panes.slice(1).map((pane) => pane.tabId);
+    const parentTab = tabs.find((tab) => tab.tabId === parentTabId);
+    if (!layout || !parentTab) return;
+    const plan = planCloseSplitPane(
+      layout,
+      parentTabId,
+      paneId,
+      activePaneByTab[parentTabId] ?? parentTabId,
+      parentTab.title
+    );
+    if (!plan) return;
+    if (plan.kind === "close-tab") {
+      closeTab(parentTabId);
+      return;
+    }
+
     setSplitLayouts((prev) => {
       const next = { ...prev };
-      delete next[parentTabId];
+      if (plan.layout) next[parentTabId] = plan.layout;
+      else delete next[parentTabId];
       return next;
     });
     setActivePaneByTab((prev) => {
       const next = { ...prev };
-      delete next[parentTabId];
+      if (plan.layout) next[parentTabId] = plan.nextActivePaneId;
+      else delete next[parentTabId];
       return next;
     });
-    for (const id of cleanupIds) {
-      outputBuffers.current.delete(id);
-      termIds.current.delete(id);
-      removeSurface(id);
+    if (plan.promotedStatus) {
+      setTabs((prev) =>
+        prev.map((tab) =>
+          tab.tabId === parentTabId
+            ? { ...tab, status: plan.promotedStatus! }
+            : tab
+        )
+      );
     }
-    requestCloseAgentKeys(cleanupIds);
-    setTerminalSizes((prev) => {
-      let changed = false;
+    cleanupTerminalPanes([plan.paneId]);
+  };
+
+  const closeSplitTab = (parentTabId: string) => {
+    const layout = splitLayouts[parentTabId];
+    if (!layout) return;
+    const parentTab = tabs.find((tab) => tab.tabId === parentTabId);
+    const originalPane = layout.panes.find((pane) => pane.tabId === parentTabId);
+    const survivor =
+      originalPane ??
+      layout.panes.find(
+        (pane) => pane.tabId === activePaneByTab[parentTabId]
+      ) ??
+      layout.panes[0];
+    const cleanupIds = layout.panes
+      .filter((pane) => pane.tabId !== survivor.tabId)
+      .map((pane) => pane.tabId);
+
+    setSplitLayouts((prev) => {
       const next = { ...prev };
-      for (const id of cleanupIds) {
-        if (id in next) {
-          delete next[id];
-          changed = true;
-        }
+      if (survivor.tabId === parentTabId) delete next[parentTabId];
+      else {
+        next[parentTabId] = {
+          ...layout,
+          panes: [
+            {
+              ...survivor,
+              title: parentTab?.title ?? survivor.title,
+            },
+          ],
+        };
       }
-      return changed ? next : prev;
+      return next;
     });
+    setActivePaneByTab((prev) => {
+      const next = { ...prev };
+      if (survivor.tabId === parentTabId) delete next[parentTabId];
+      else next[parentTabId] = survivor.tabId;
+      return next;
+    });
+    if (survivor.tabId !== parentTabId) {
+      setTabs((prev) =>
+        prev.map((tab) =>
+          tab.tabId === parentTabId
+            ? { ...tab, status: survivor.status }
+            : tab
+        )
+      );
+    }
+    cleanupTerminalPanes(cleanupIds);
   };
 
   const commandItems = useMemo<CommandPaletteItem[]>(() => {
@@ -1048,7 +1151,7 @@ function AppInner() {
         id: "new-window",
         title: "打开新窗口",
         section: "视图",
-        subtitle: "创建一个新的 TermAI 桌面窗口",
+        subtitle: "创建一个新的 Termexa 桌面窗口",
         icon: "window",
         keywords: ["window"],
         onRun: () => api.openNewWindow(),
@@ -1186,7 +1289,11 @@ function AppInner() {
             className={`toolbar-btn${aiPanelVisible ? " active" : ""}`}
             onClick={() => setAiVisible((v) => !v)}
             disabled={aiSuppressedBySftp}
-            title={aiSuppressedBySftp ? "SFTP 页面自动折叠 AI，切回终端后恢复" : "切换 AI 面板"}
+            title={
+              aiSuppressedBySftp
+                ? "SFTP 页面自动折叠 AI，切回终端后恢复"
+                : "命令助手 Ctrl+Shift+Y"
+            }
           >
             <Icon name="ai" />
             AI
@@ -1272,7 +1379,7 @@ function AppInner() {
           <div className="terminals">
             {tabs.length === 0 && (
               <div className="welcome">
-                <h2>TermAI</h2>
+                <h2>Termexa</h2>
                 <p>AI 原生的现代化远程终端</p>
                 <div className="welcome-actions">
                   <button className="btn primary" onClick={openLocal}>
@@ -1321,16 +1428,30 @@ function AppInner() {
                   {(splitLayouts[t.tabId]?.panes ?? [t]).map((pane) => {
                     const activePaneId = activePaneByTab[t.tabId] ?? t.tabId;
                     const paneActive = t.tabId === activeTab && pane.tabId === activePaneId;
+                    const paneLayout = splitLayouts[t.tabId];
                     return (
                       <div
                         key={pane.tabId}
                         className={`split-pane${paneActive ? " active" : ""}`}
                         onMouseDown={() => activatePane(t.tabId, pane.tabId)}
                       >
-                        {(splitLayouts[t.tabId]?.panes.length ?? 1) > 1 && (
+                        {paneLayout && (
                           <div className="split-pane-label">
                             <span className={`status-dot ${pane.status}`} />
-                            <span>{pane.title}</span>
+                            <span className="split-pane-title">{pane.title}</span>
+                            <button
+                              type="button"
+                              className="split-pane-close"
+                              title="关闭此分屏"
+                              aria-label={`关闭分屏 ${pane.title}`}
+                              onMouseDown={(event) => event.stopPropagation()}
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                closeSplitPane(t.tabId, pane.tabId);
+                              }}
+                            >
+                              <Icon name="close" size={13} />
+                            </button>
                           </div>
                         )}
                         <TerminalView
@@ -1344,6 +1465,7 @@ function AppInner() {
                           registerTermId={registerTermId}
                           onSize={onTerminalSize}
                           onAskAi={askAi}
+                          onOpenCommandAssistant={openCommandAssistant}
                           agentAvailable={
                             hasProvider &&
                             pane.kind === "ssh" &&

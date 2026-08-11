@@ -54,6 +54,7 @@ updated: 2026-07-31
 - [x] 完成 stale Runtime 停止幂等收口与传统 AI 隐藏保活（2026-07-31）
 - [x] 校正本轮 SSH 范围与固定 safe-auto 执行策略文档（2026-07-31）
 - [x] 按原生终端层级重做模式条、Shell 文本流、内联 Agent 区域和提示符输入（2026-07-31）
+- [x] 完成自动/固定输入模式、状态指示和终端快捷键闭环（2026-07-31）
 
 ## 验证结果
 
@@ -239,6 +240,19 @@ updated: 2026-07-31
 - 自然语言回复显式使用中文 UI 阅读字体和更舒展行距，Shell 命令、输出、路径、行内代码
   与代码块继续使用等宽字体。CSS 实际计算值和 4px 模式状态点已通过 dev 视觉夹具复核，
   证据见 `output/termai-mode-css-probe.png`。
+- 输入路由升级为每标签稳定的 `auto / shell / agent` 三态：自动模式以呼吸圆点跟随语义，
+  固定 Shell/Agent 以实线下划线表示；清空时间线、Shell Prompt 到达和标签切换均保持状态
+  一致。固定 Shell 直接写入 PTY，不再执行语义分类，提交和中断边界会清理旧捕获缓冲。
+- `Ctrl+Shift+I` 在自动与固定 Agent 间切换，Provider 不可用和 Raw Terminal 状态不会留下
+  无效固定模式；`Ctrl+Shift+Y` 打开传统命令助手、切到非 Agent 对话并聚焦输入框，不发送
+  空请求。快捷键提示已放入 Agent 图标和顶部 AI 按钮 tooltip。
+- 桌面 dev 实测：在保存的 `38.244.23.117:18454` 标签点击固定 Shell 后，下划线状态和
+  “固定模式”可访问文案同步出现；执行 `printf 'FIXED_SHELL_OK\n'` 返回预期输出，提交后
+  固定 Shell 保持不变。复核期间检测到用户正在使用桌面，未继续抢占焦点测试快捷键。
+- 最终回归：Node `126/126` 通过；`pnpm build` 通过；Rust `42` 项通过、4 项需显式
+  Provider/Docker 环境的 smoke test 按条件忽略；`git diff --check` 通过。独立代码审查
+  发现并修复 Provider 不可用快捷键脏状态和 Shell Prompt 覆盖固定 Agent 两项问题，
+  修复后二次审查无剩余必须修项。
 - 代码审查修复两项状态边界：内联 Composer 不继承旧 xterm 捕获可靠性；AI Provider
   关闭后不会保留禁用的 Agent 选中态。Node 全量 `117/117`、`pnpm build` 与
   `git diff --check` 通过。
@@ -289,7 +303,7 @@ updated: 2026-07-31
 
 | 能力 | 自动化证据 | 桌面证据 | 状态 |
 | --- | --- | --- | --- |
-| Shell/Agent 自动感知与一次性手动覆盖 | `inputRouter`、`inputDecisionModel` 测试 | Shell、自然语言和 Tab 接管实测 | 已验证 |
+| Shell/Agent 自动感知与固定模式 | `inputRouter`、`inputDecisionModel` 测试 | 自动圆点、固定 Shell 下划线和真实命令实测 | 已验证 |
 | Shell/Agent/审批/执行/总结统一 Block 时间线 | Runtime、Renderer、Block protocol 测试 | 双主机真实 Agent 诊断与危险拒绝实测 | 已验证 |
 | typed action 与固定 safe-auto | 风险白名单、协议 fail-closed 测试 | 只读自动执行、危险命令审批实测 | 已验证 |
 | 执行中追加、停止、12 轮续期 | Runtime 队列、停止、续期测试 | `vmstat` 追加、停止和继续实测 | 已验证 |

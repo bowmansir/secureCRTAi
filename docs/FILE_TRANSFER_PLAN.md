@@ -1,6 +1,6 @@
 # 文件传输专项规划 — 打造核心竞争优势
 
-> 定位：文件传输是 TermAI 相对 SecureCRT（+SecureFX）的头号差异化能力。
+> 定位：文件传输是 Termexa 相对 SecureCRT（+SecureFX）的头号差异化能力。
 > 目标：比 SecureFX 更快、比 WinSCP 更顺手、和终端与 AI 深度融合。
 
 ## 1. 竞品痛点分析

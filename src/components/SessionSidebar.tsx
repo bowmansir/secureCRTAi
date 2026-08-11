@@ -6,7 +6,8 @@ import Icon from "./Icons";
 import type { HostHealthView, SessionProfile, Snippet } from "../types";
 
 const DEFAULT_GROUP = "默认分组";
-const COLLAPSED_GROUPS_KEY = "termai.collapsedGroups";
+const COLLAPSED_GROUPS_KEY = "termexa.collapsedGroups";
+const LEGACY_COLLAPSED_GROUPS_KEY = "termai.collapsedGroups";
 const DRAG_THRESHOLD = 5;
 
 interface DragSessionState {
@@ -22,10 +23,17 @@ interface DragSessionState {
 
 function loadCollapsedGroups(): Set<string> {
   try {
-    const raw = localStorage.getItem(COLLAPSED_GROUPS_KEY);
+    const current = localStorage.getItem(COLLAPSED_GROUPS_KEY);
+    const raw = current ?? localStorage.getItem(LEGACY_COLLAPSED_GROUPS_KEY);
     if (raw) {
       const parsed = JSON.parse(raw);
-      if (Array.isArray(parsed)) return new Set(parsed.filter((v) => typeof v === "string"));
+      if (Array.isArray(parsed)) {
+        const collapsedGroups = parsed.filter((v) => typeof v === "string");
+        if (current === null) {
+          localStorage.setItem(COLLAPSED_GROUPS_KEY, JSON.stringify(collapsedGroups));
+        }
+        return new Set(collapsedGroups);
+      }
     }
   } catch {
     /* 使用默认折叠状态 */

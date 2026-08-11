@@ -22,6 +22,23 @@ import type {
   TransferEvent,
 } from "./types";
 
+export interface DesktopProbeEventInput {
+  event:
+    | "startup"
+    | "update_check"
+    | "update_available"
+    | "update_up_to_date"
+    | "update_install"
+    | "update_error";
+  status: "started" | "succeeded" | "failed";
+  targetVersion?: string;
+  errorCode?: "configuration" | "network" | "signature" | "generic";
+}
+
+export function desktopProbeReport(input: DesktopProbeEventInput): Promise<boolean> {
+  return invoke<boolean>("desktop_probe_report", { input });
+}
+
 // ---------- 主题 ----------
 
 export function themeList(): Promise<ThemeLibraryView> {
@@ -87,9 +104,10 @@ export function agentOpen(sessionId: string): Promise<string> {
 
 export function agentRun(
   id: string,
-  command: string
+  command: string,
+  timeoutMs: number
 ): Promise<{ output: string; exitCode: number | null }> {
-  return invoke("agent_run", { id, command });
+  return invoke("agent_run", { id, command, timeoutMs });
 }
 
 export function agentInterrupt(id: string): Promise<void> {
@@ -349,6 +367,12 @@ export function healthCheckSessions(
 
 export function sessionSave(input: SessionInput): Promise<SessionProfile> {
   return invoke("session_save", { input });
+}
+
+export function sessionTestConnection(
+  input: SessionInput
+): Promise<{ latencyMs: number; message: string }> {
+  return invoke("session_test_connection", { input });
 }
 
 export function sessionDelete(id: string): Promise<void> {

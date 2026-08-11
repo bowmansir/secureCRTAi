@@ -35,7 +35,7 @@ pub struct ShellIntegrationParser {
 impl ShellIntegrationParser {
     pub fn new(nonce: &str) -> Self {
         Self {
-            marker_prefix: format!("\x1b]633;TermAI;{nonce};").into_bytes(),
+            marker_prefix: format!("\x1b]633;Termexa;{nonce};").into_bytes(),
             pending: Vec::new(),
         }
     }
@@ -160,16 +160,14 @@ fn partial_prefix_len(bytes: &[u8], prefix: &[u8]) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        IntegrationEvent, ParsedItem, ShellIntegrationParser, MAX_MARKER_BYTES,
-    };
+    use super::{IntegrationEvent, ParsedItem, ShellIntegrationParser, MAX_MARKER_BYTES};
     use base64::engine::general_purpose::STANDARD as B64;
     use base64::Engine;
 
     const NONCE: &str = "testnonce";
 
     fn marker(payload: &str) -> String {
-        format!("\x1b]633;TermAI;{NONCE};{payload}\x07")
+        format!("\x1b]633;Termexa;{NONCE};{payload}\x07")
     }
 
     #[test]
@@ -206,7 +204,7 @@ mod tests {
         let mut parser = ShellIntegrationParser::new(NONCE);
 
         assert_eq!(
-            parser.feed(b"hello\x1b]633;TermAI;test"),
+            parser.feed(b"hello\x1b]633;Termexa;test"),
             vec![ParsedItem::Data(b"hello".to_vec())]
         );
         assert_eq!(
@@ -271,18 +269,15 @@ mod tests {
 
     #[test]
     fn treats_a_marker_with_the_wrong_nonce_as_terminal_data() {
-        let input = b"\x1b]633;TermAI;wrongnonce;P;0;L3RtcA==\x07";
+        let input = b"\x1b]633;Termexa;wrongnonce;P;0;L3RtcA==\x07";
         let mut parser = ShellIntegrationParser::new(NONCE);
 
-        assert_eq!(
-            parser.feed(input),
-            vec![ParsedItem::Data(input.to_vec())]
-        );
+        assert_eq!(parser.feed(input), vec![ParsedItem::Data(input.to_vec())]);
     }
 
     #[test]
     fn flushes_an_oversized_incomplete_marker_instead_of_freezing_output() {
-        let prefix = format!("\x1b]633;TermAI;{NONCE};");
+        let prefix = format!("\x1b]633;Termexa;{NONCE};");
         let input = format!("{prefix}{}tail", "x".repeat(MAX_MARKER_BYTES));
         let mut parser = ShellIntegrationParser::new(NONCE);
 
@@ -301,10 +296,7 @@ mod tests {
     #[test]
     fn flushes_an_incomplete_marker_when_the_stream_ends() {
         let mut parser = ShellIntegrationParser::new(NONCE);
-        assert!(parser.feed(b"output\x1b]633;TermAI;test").len() == 1);
-        assert_eq!(
-            parser.finish(),
-            b"\x1b]633;TermAI;test".to_vec()
-        );
+        assert!(parser.feed(b"output\x1b]633;Termexa;test").len() == 1);
+        assert_eq!(parser.finish(), b"\x1b]633;Termexa;test".to_vec());
     }
 }

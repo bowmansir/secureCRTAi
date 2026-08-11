@@ -6,6 +6,7 @@ import {
   buildAgentActionRepairRequest,
   buildAgentFeedback,
   getAgentBatchDisposition,
+  prepareAgentCommand,
   type AgentCommandResult,
 } from "../src/agent/agentProtocol.ts";
 
@@ -37,6 +38,14 @@ test("completed and failed executions can still be returned to the agent", () =>
     status: "failed",
     exitCode: 1,
     shouldContinue: true,
+  });
+});
+
+test("unknown execution state stops automatic replanning", () => {
+  assert.deepEqual(getAgentBatchDisposition([result(null)], false), {
+    status: "failed",
+    exitCode: null,
+    shouldContinue: false,
   });
 });
 
@@ -77,7 +86,7 @@ test("remote output remains diagnostic evidence without gaining execution author
 
 test("action repair request only normalizes an existing plan", () => {
   const request = buildAgentActionRepairRequest(
-    '```termai-actions\n{"actions":[{"type":"shell.execute","command":42}]}\n```',
+    '```termexa-actions\n{"actions":[{"type":"shell.execute","command":42}]}\n```',
     ["shell.execute.command 必须是字符串"]
   );
 
@@ -91,4 +100,65 @@ test("action repair request only normalizes an existing plan", () => {
   assert.match(request, /shell\.execute\.command 必须是字符串/);
   assert.match(request, /"command":42/);
   assert.match(request, /不要执行或新增命令/);
+});
+
+test("agent protocol forbids executing templates as shell commands", () => {
+  assert.match(AGENT_SYSTEM_PROMPT, /禁止把 <业务线>/);
+  assert.match(AGENT_SYSTEM_PROMPT, /日志行、终端输出、错误正文/);
+  assert.match(AGENT_SYSTEM_PROMPT, /必须生成以 grep、awk、sed、journalctl/);
+  assert.match(AGENT_SYSTEM_PROMPT, /裸 key=value 查询参数/);
+  assert.match(AGENT_SYSTEM_PROMPT, /缺少真实参数时/);
+  assert.match(AGENT_SYSTEM_PROMPT, /mktemp \/目标目录\/\.termexa_write_test\.XXXXXX/);
+  assert.match(AGENT_SYSTEM_PROMPT, /同一个明确的业务变更.*一次需确认动作/);
+  assert.match(AGENT_SYSTEM_PROMPT, /状态核验必须使用只读命令/);
+});
+
+test("persistent diagnostics become five-second Agent samples", () => {
+  for (const command of [
+    "pm2 log 0",
+    "pm2 logs --lines 100",
+    "tail -f /var/log/messages",
+    "tail -F /var/log/messages",
+    "journalctl -fu nginx",
+    "docker logs -f nginx",
+    "docker stats",
+    "docker compose logs --follow api",
+    "kubectl logs --follow deployment/api",
+    "watch -n 1 uptime",
+    "sleep 10",
+    "timeout 30s pm2 logs 0",
+  ]) {
+    const prepared = prepareAgentCommand(command);
+    assert.equal(
+      prepared.command,
+      `timeout 5s ${command} || [ $? -eq 124 ]`,
+      command
+    );
+    assert.match(prepared.note ?? "", /5 秒/);
+  }
+
+  assert.equal(
+    prepareAgentCommand(
+      "if command -v pm2; then pm2 logs 0; fi"
+    ).command,
+    "timeout 5s sh -c 'if command -v pm2; then pm2 logs 0; fi' || [ $? -eq 124 ]"
+  );
+  assert.equal(
+    prepareAgentCommand("echo ready; sleep 30").command,
+    "timeout 5s sh -c 'echo ready; sleep 30' || [ $? -eq 124 ]"
+  );
+  assert.equal(
+    prepareAgentCommand("echo 'ready'; sleep 30").command,
+    "timeout 5s sh -c 'echo '\"'\"'ready'\"'\"'; sleep 30' || [ $? -eq 124 ]"
+  );
+  assert.equal(
+    prepareAgentCommand("pm2 logs 0 --lines 100 --nostream").command,
+    "pm2 logs 0 --lines 100 --nostream"
+  );
+  assert.equal(
+    prepareAgentCommand(
+      "timeout 5s pm2 logs 0 || [ $? -eq 124 ]"
+    ).command,
+    "timeout 5s pm2 logs 0 || [ $? -eq 124 ]"
+  );
 });

@@ -1,12 +1,12 @@
 [package]
-name = "termai"
-version = "0.1.0"
-description = "TermAI - AI-native remote terminal manager"
-authors = ["termai"]
+name = "termexa"
+version = "0.1.5"
+description = "Termexa - AI-native remote terminal manager"
+authors = ["termexa"]
 edition = "2021"
 
 [lib]
-name = "termai_lib"
+name = "termexa_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
@@ -31,6 +31,8 @@ russh-sftp = "2.3"
 # 密钥生成：与 russh 内嵌同一版本，仅补开 getrandom feature（feature 叠加，类型一致）
 ssh-key = { version = "=0.7.0-rc.11", features = ["ed25519", "getrandom"] }
 tauri-plugin-dialog = "2"
+tauri-plugin-process = "2"
+tauri-plugin-updater = "2"
 
 # vault / crypto
 keyring = { version = "3", features = ["windows-native", "apple-native", "linux-native"] }
@@ -41,6 +43,10 @@ rand = "0.8"
 base64 = "0.22"
 dirs = "6"
 trash = "5"
+rsa = { version = "0.9", features = ["sha2"] }
+hostname = "0.4"
+os_info = "3"
+sys-locale = "0.3"
 
 # ai
 reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }

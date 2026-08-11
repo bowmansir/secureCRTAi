@@ -1,5 +1,5 @@
 export type TerminalInputTarget = "shell" | "agent";
-export type TerminalManualOverride = TerminalInputTarget | null;
+export type TerminalRoutingMode = "auto" | TerminalInputTarget;
 export type AgentExecutionPolicy = "safe-auto";
 export type AgentContextPolicy = "none" | "recent" | "selected-blocks";
 export const MAX_CONTEXT_ATTACHMENTS = 20;
@@ -126,7 +126,7 @@ export type TerminalBlock =
 export type TerminalSurfaceState = {
   surfaceId: string;
   inputTarget: TerminalInputTarget;
-  manualOverride: TerminalManualOverride;
+  routingMode: TerminalRoutingMode;
   executionPolicy: AgentExecutionPolicy;
   contextPolicy: AgentContextPolicy;
   contextAttachments: ContextAttachment[];
@@ -140,7 +140,7 @@ export type TerminalSurfaceState = {
 
 export type TerminalSurfaceAction =
   | { type: "set-input-target"; target: TerminalInputTarget }
-  | { type: "set-manual-override"; target: TerminalManualOverride }
+  | { type: "set-routing-mode"; mode: TerminalRoutingMode }
   | { type: "set-context-policy"; policy: AgentContextPolicy }
   | { type: "set-draft"; draft: string }
   | { type: "set-environment"; environment: TerminalSurfaceEnvironment | null }
@@ -158,7 +158,7 @@ export function createTerminalSurfaceState(surfaceId: string): TerminalSurfaceSt
   return {
     surfaceId,
     inputTarget: "shell",
-    manualOverride: null,
+    routingMode: "auto",
     executionPolicy: "safe-auto",
     contextPolicy: "recent",
     contextAttachments: [],
@@ -176,10 +176,10 @@ export function reduceTerminalSurface(
   switch (action.type) {
     case "set-input-target":
       return state.inputTarget === action.target ? state : { ...state, inputTarget: action.target };
-    case "set-manual-override":
-      return state.manualOverride === action.target
+    case "set-routing-mode":
+      return state.routingMode === action.mode
         ? state
-        : { ...state, manualOverride: action.target };
+        : { ...state, routingMode: action.mode };
     case "set-context-policy":
       return state.contextPolicy === action.policy
         ? state
@@ -240,21 +240,21 @@ export function reduceTerminalSurface(
       const blocks = state.blocks.filter((block) => block.id !== action.blockId);
       return blocks.length === state.blocks.length ? state : { ...state, blocks };
     }
-    case "clear":
+    case "clear": {
+      const resetTarget =
+        state.routingMode === "agent" ? "agent" : "shell";
       return state.blocks.length === 0 &&
         state.contextAttachments.length === 0 &&
         state.control === "idle" &&
         state.draft === "" &&
-        state.inputTarget === "shell" &&
-        state.manualOverride === null &&
+        state.inputTarget === resetTarget &&
         state.contextPolicy === "recent" &&
         !state.conversationId &&
         !state.runtimeId
         ? state
         : {
             ...state,
-            inputTarget: "shell",
-            manualOverride: null,
+            inputTarget: resetTarget,
             contextPolicy: "recent",
             control: "idle",
             blocks: [],
@@ -263,6 +263,7 @@ export function reduceTerminalSurface(
             conversationId: undefined,
             runtimeId: undefined,
           };
+    }
   }
 }
 

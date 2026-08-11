@@ -217,7 +217,7 @@ export default function InlineAgentTimeline({
               >
                 <div className="terminal-agent-block-heading">
                   <span className="terminal-agent-heading-dot" />
-                  <strong>TermAI</strong>
+                  <strong>Termexa</strong>
                   <span>
                     {block.status === "streaming"
                       ? "正在分析"
@@ -227,26 +227,6 @@ export default function InlineAgentTimeline({
                           ? "执行计划"
                           : "分析完成"}
                   </span>
-                  {collapsible && (
-                    <button
-                      type="button"
-                      className={`terminal-agent-message-toggle${
-                        expanded ? " expanded" : ""
-                      }`}
-                      onClick={() =>
-                        setExpandedMessageIds((current) => {
-                          const next = new Set(current);
-                          if (next.has(block.id)) next.delete(block.id);
-                          else next.add(block.id);
-                          return next;
-                        })
-                      }
-                      aria-expanded={expanded}
-                    >
-                      {expanded ? "收起" : "展开"}
-                      <Icon name="chevronDown" size={12} />
-                    </button>
-                  )}
                 </div>
                 <div
                   className={`terminal-agent-message-content${
@@ -264,6 +244,28 @@ export default function InlineAgentTimeline({
                     <span className="cursor-blink">▌</span>
                   )}
                 </div>
+                {collapsible && (
+                  <button
+                    type="button"
+                    className={`terminal-agent-message-toggle${
+                      expanded ? " expanded" : ""
+                    }`}
+                    onClick={() =>
+                      setExpandedMessageIds((current) => {
+                        const next = new Set(current);
+                        if (next.has(block.id)) next.delete(block.id);
+                        else next.add(block.id);
+                        return next;
+                      })
+                    }
+                    aria-expanded={expanded}
+                    aria-label={expanded ? "收起分析内容" : "展开全部分析内容"}
+                    title={expanded ? "收起分析内容" : "展开全部分析内容"}
+                  >
+                    <span>{expanded ? "收起" : "展开全部"}</span>
+                    <Icon name="chevronDown" size={13} />
+                  </button>
+                )}
               </div>
             );
           }

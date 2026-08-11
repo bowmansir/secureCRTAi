@@ -28,6 +28,7 @@ import {
   redactSensitiveContent,
 } from "./contextAssembler.ts";
 import {
+  AgentCommandExecutionError,
   getAgentRuntimeKey,
 } from "./channelRegistry.ts";
 import type {
@@ -99,6 +100,7 @@ type RuntimeEntry = {
   goal: string;
   history: ChatMessage[];
   executedCommands: Set<string>;
+  approvedCommands: Set<string>;
   queue: QueuedInstruction[];
   pausedBatch?: PausedBatch;
   activeMessageBlockId?: string;
@@ -120,21 +122,25 @@ function actionLabel(action: AgentTypedAction): string {
   }
 }
 
+function approvalKey(action: ShellExecuteAction): string {
+  return `${action.cwd ?? ""}\0${action.command.trim()}`;
+}
+
 function shouldAttemptActionRepair(
   response: string,
   actionPlan: AgentActionPlan
 ): boolean {
-  if (actionPlan.source === "typed" && actionPlan.errors.length > 0) {
-    return true;
-  }
+  if (actionPlan.source === "typed" && actionPlan.errors.length > 0) return true;
   return (
     actionPlan.source === "none" &&
-    /(?:```termai-actions|["']?actions["']?\s*:)/i.test(response)
+    /(?:```(?:termexa|termai)-actions|["']?actions["']?\s*:)/i.test(response)
   );
 }
 
 function getOriginalActionEnvelope(response: string): string {
-  const fenced = response.match(/```termai-actions[^\S\r\n]*\r?\n?([\s\S]*?)(?:```|$)/i);
+  const fenced = response.match(
+    /```(?:termexa|termai)-actions[^\S\r\n]*\r?\n?([\s\S]*?)(?:```|$)/i
+  );
   if (fenced?.[1]) return fenced[1];
   return response;
 }
@@ -342,6 +348,7 @@ export class TerminalAgentRuntime {
       goal: "",
       history: [],
       executedCommands: new Set(),
+      approvedCommands: new Set(),
       queue: [],
     };
   }
@@ -656,6 +663,7 @@ export class TerminalAgentRuntime {
     const results: AgentCommandResult[] = [];
     let rejectedCommand: string | undefined;
     let errored = false;
+    let unknownExecutionState = false;
     for (const sourceAction of actions) {
       if (!this.isCurrent(entry, generation)) return;
       if (sourceAction.type === "terminal.readBlocks") {
@@ -716,8 +724,9 @@ export class TerminalAgentRuntime {
       }
 
       try {
-        let approved = false;
+        let approved = entry.approvedCommands.has(approvalKey(action));
         let outcome = await this.deps.channels.execute(action, {
+          approved,
           runtimeKey: getAgentRuntimeKey("terminal", entry.surfaceId),
         });
         while (outcome.status === "approval-required") {
@@ -734,7 +743,7 @@ export class TerminalAgentRuntime {
             rejectedCommand = action.command;
             results.push({
               command: action.command,
-              note: "用户拒绝了高风险命令，本批次后续动作已停止。",
+              note: "用户拒绝了需确认命令，本批次后续动作已停止。",
               exitCode: null,
               output: "已拒绝执行。",
               outputChars: 0,
@@ -746,9 +755,10 @@ export class TerminalAgentRuntime {
             const command = decision.command.trim();
             if (!command) continue;
             action = { ...action, command };
-            approved = false;
+            approved = entry.approvedCommands.has(approvalKey(action));
           } else {
             approved = true;
+            entry.approvedCommands.add(approvalKey(action));
           }
           this.deps.dispatch(entry.surfaceId, {
             type: "set-control",
@@ -769,16 +779,30 @@ export class TerminalAgentRuntime {
           );
           results.push({
             command: action.command,
-            note: prepared.note,
+            note:
+              outcome.result.exitCode === null
+                ? [
+                    prepared.note,
+                    "执行结果未知，已停止自动执行；继续前应先只读核验远端状态。",
+                  ]
+                    .filter(Boolean)
+                    .join(" ")
+                : prepared.note,
             exitCode: outcome.result.exitCode,
             output: clipped.text,
             outputChars: outcome.result.output.length,
             truncated: clipped.truncated,
           });
+          if (outcome.result.exitCode === null) {
+            errored = true;
+            unknownExecutionState = true;
+            break;
+          }
           if (outcome.result.exitCode !== 0) break;
         }
       } catch (error) {
         errored = true;
+        unknownExecutionState = error instanceof AgentCommandExecutionError;
         results.push({
           command: action.command,
           note: "命令执行失败，本批次后续动作已停止。",
@@ -829,6 +853,28 @@ export class TerminalAgentRuntime {
         kind: "agent-message",
         createdAt: this.deps.now(),
         content: `任务已停止：你拒绝执行 \`${rejectedCommand}\`，该命令及本批次后续动作均未执行。`,
+        status: "complete",
+      };
+      this.deps.dispatch(entry.surfaceId, {
+        type: "append-block",
+        block: messageBlock,
+      });
+      this.deps.dispatch(entry.surfaceId, {
+        type: "set-control",
+        control: "idle",
+      });
+      await this.processQueued(entry);
+      return;
+    }
+
+    if (unknownExecutionState) {
+      entry.busy = false;
+      const messageBlock: AgentMessageBlock = {
+        id: this.deps.createId(),
+        kind: "agent-message",
+        createdAt: this.deps.now(),
+        content:
+          "任务已暂停：执行通道未能确认命令的最终状态。为避免重复执行可能已部分生效的操作，请先用只读命令核验远端状态后再继续。",
         status: "complete",
       };
       this.deps.dispatch(entry.surfaceId, {

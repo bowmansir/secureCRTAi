@@ -11,11 +11,27 @@ export type AgentCommandOutput = {
   exitCode: number | null;
 };
 
+export class AgentCommandExecutionError extends Error {
+  constructor(error: unknown) {
+    super(error instanceof Error ? error.message : String(error));
+    this.name = "AgentCommandExecutionError";
+  }
+}
+
 export type AgentChannelBackend = {
   open: (sessionId: string) => Promise<string>;
-  run: (channelId: string, command: string) => Promise<AgentCommandOutput>;
+  run: (
+    channelId: string,
+    command: string,
+    timeoutMs: number
+  ) => Promise<AgentCommandOutput>;
   interrupt: (channelId: string) => Promise<void>;
   close: (channelId: string) => Promise<void>;
+};
+
+type AgentChannelRegistryOptions = {
+  watchdogGraceMs?: number;
+  interruptWaitMs?: number;
 };
 
 export type AgentExecutionOutcome =
@@ -47,9 +63,16 @@ type ChannelEntry = {
 export class AgentChannelRegistry {
   private entries = new Map<string, ChannelEntry>();
   private readonly backend: AgentChannelBackend;
+  private readonly watchdogGraceMs: number;
+  private readonly interruptWaitMs: number;
 
-  constructor(backend: AgentChannelBackend) {
+  constructor(
+    backend: AgentChannelBackend,
+    options: AgentChannelRegistryOptions = {}
+  ) {
     this.backend = backend;
+    this.watchdogGraceMs = options.watchdogGraceMs ?? 8_000;
+    this.interruptWaitMs = options.interruptWaitMs ?? 250;
   }
 
   has(runtimeKey: string): boolean {
@@ -103,11 +126,19 @@ export class AgentChannelRegistry {
       if (!this.isCurrent(entry, generation)) {
         return { status: "cancelled", action };
       }
-      const result = await this.withTimeout(
-        this.backend.run(channelId, action.command),
-        action.timeoutMs,
-        async () => this.close(runtimeKey)
-      );
+      let result: AgentCommandOutput;
+      try {
+        result = await this.withTimeout(
+          this.backend.run(channelId, action.command, action.timeoutMs),
+          action.timeoutMs + this.watchdogGraceMs,
+          async () => this.close(runtimeKey)
+        );
+      } catch (error) {
+        if (this.isCurrent(entry, generation)) {
+          await this.close(runtimeKey);
+        }
+        throw new AgentCommandExecutionError(error);
+      }
       if (!this.isCurrent(entry, generation)) {
         return { status: "cancelled", action };
       }
@@ -127,8 +158,7 @@ export class AgentChannelRegistry {
     this.entries.delete(runtimeKey);
     const channelId = entry.channelId ?? (await entry.opening?.catch(() => undefined));
     if (!channelId) return;
-    await this.backend.interrupt(channelId).catch(() => undefined);
-    await this.backend.close(channelId).catch(() => undefined);
+    await this.releaseChannel(channelId, true);
   }
 
   async close(runtimeKey: string): Promise<void> {
@@ -138,10 +168,7 @@ export class AgentChannelRegistry {
     this.entries.delete(runtimeKey);
     const channelId = entry.channelId ?? (await entry.opening?.catch(() => undefined));
     if (!channelId) return;
-    if (entry.executing) {
-      await this.backend.interrupt(channelId).catch(() => undefined);
-    }
-    await this.backend.close(channelId).catch(() => undefined);
+    await this.releaseChannel(channelId, entry.executing);
   }
 
   async closeAll(): Promise<void> {
@@ -177,6 +204,26 @@ export class AgentChannelRegistry {
     );
   }
 
+  private async releaseChannel(
+    channelId: string,
+    shouldInterrupt: boolean
+  ): Promise<void> {
+    if (shouldInterrupt) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          this.backend.interrupt(channelId).catch(() => undefined),
+          new Promise<void>((resolve) => {
+            timer = setTimeout(resolve, this.interruptWaitMs);
+          }),
+        ]);
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    }
+    await this.backend.close(channelId).catch(() => undefined);
+  }
+
   private async withTimeout<T>(
     promise: Promise<T>,
     timeoutMs: number,
@@ -185,7 +232,7 @@ export class AgentChannelRegistry {
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeout = new Promise<T>((_, reject) => {
       timer = setTimeout(() => {
-        reject(new Error("Agent 执行超时，执行通道正在关闭"));
+        reject(new Error("Agent 响应超时，旧执行通道已隔离，请重试"));
         void onTimeout();
       }, timeoutMs);
     });

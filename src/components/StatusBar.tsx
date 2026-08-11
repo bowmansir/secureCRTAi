@@ -98,7 +98,7 @@ export default function StatusBar({
         )}
         <span className="sb-item">终端 {terminalCount}</span>
         <span className="sb-item">UTF-8</span>
-        <span className="sb-brand">TermAI</span>
+        <span className="sb-brand">Termexa</span>
       </div>
     </div>
   );

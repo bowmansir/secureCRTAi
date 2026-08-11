@@ -2,7 +2,7 @@
 
 ## 1. 目标
 
-把 TermAI 演进为按终端标签隔离的 Agent-native surface，同时保留显式打开的传统
+把 Termexa 演进为按终端标签隔离的 Agent-native surface，同时保留显式打开的传统
 AI 面板：
 
 - Shell 命令和自然语言共用一个输入入口。

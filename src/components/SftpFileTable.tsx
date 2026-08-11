@@ -6,7 +6,8 @@ import Icon from "./Icons";
 const ROW_HEIGHT = 30;
 const HEADER_HEIGHT = 29;
 const OVERSCAN = 8;
-const COLUMN_WIDTHS_KEY = "termai.sftpColumnWidths";
+const COLUMN_WIDTHS_KEY = "termexa.sftpColumnWidths";
+const LEGACY_COLUMN_WIDTHS_KEY = "termai.sftpColumnWidths";
 const OPS_COL_WIDTH = 90;
 const GRID_GAP_TOTAL = 24;
 const ROW_PADDING_TOTAL = 24;
@@ -65,14 +66,19 @@ function clamp(n: number, min: number, max: number): number {
 
 function loadColumnWidths(): ColumnWidths {
   try {
-    const raw = localStorage.getItem(COLUMN_WIDTHS_KEY);
+    const current = localStorage.getItem(COLUMN_WIDTHS_KEY);
+    const raw = current ?? localStorage.getItem(LEGACY_COLUMN_WIDTHS_KEY);
     if (!raw) return DEFAULT_COLUMN_WIDTHS;
     const parsed = JSON.parse(raw) as Partial<ColumnWidths>;
-    return {
+    const widths = {
       name: clamp(Number(parsed.name) || DEFAULT_COLUMN_WIDTHS.name, MIN_COLUMN_WIDTHS.name, MAX_COLUMN_WIDTHS.name),
       size: clamp(Number(parsed.size) || DEFAULT_COLUMN_WIDTHS.size, MIN_COLUMN_WIDTHS.size, MAX_COLUMN_WIDTHS.size),
       time: clamp(Number(parsed.time) || DEFAULT_COLUMN_WIDTHS.time, MIN_COLUMN_WIDTHS.time, MAX_COLUMN_WIDTHS.time),
     };
+    if (current === null) {
+      localStorage.setItem(COLUMN_WIDTHS_KEY, JSON.stringify(widths));
+    }
+    return widths;
   } catch {
     return DEFAULT_COLUMN_WIDTHS;
   }

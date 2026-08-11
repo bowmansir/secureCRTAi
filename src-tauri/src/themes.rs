@@ -55,9 +55,9 @@ fn safe_relative_path(raw: &str) -> Option<PathBuf> {
     if path.as_os_str().is_empty() || path.is_absolute() {
         return None;
     }
-    let safe = path.components().all(|component| {
-        matches!(component, Component::Normal(_) | Component::CurDir)
-    });
+    let safe = path
+        .components()
+        .all(|component| matches!(component, Component::Normal(_) | Component::CurDir));
     safe.then(|| path.to_path_buf())
 }
 
@@ -112,8 +112,7 @@ fn find_theme(root: &Path, theme_id: &str) -> Result<(PathBuf, ThemeManifest), S
 }
 
 fn resolve_asset(theme_dir: &Path, relative: &str) -> Result<PathBuf, String> {
-    let relative =
-        safe_relative_path(relative).ok_or_else(|| "主题素材路径不安全".to_string())?;
+    let relative = safe_relative_path(relative).ok_or_else(|| "主题素材路径不安全".to_string())?;
     let root = theme_dir
         .canonicalize()
         .map_err(|error| format!("主题目录不可用: {error}"))?;

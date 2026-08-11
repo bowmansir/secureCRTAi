@@ -3,13 +3,14 @@ import {
 } from "./inputRouter.ts";
 import type {
   TerminalInputDecision,
+  TerminalInputMode,
   TerminalInputTarget,
 } from "./inputRouter.ts";
 
 export type InputDecisionSource =
   | "raw-terminal"
-  | "manual-shell"
-  | "manual-agent"
+  | "fixed-shell"
+  | "fixed-agent"
   | "agent-unavailable"
   | "unreliable-capture"
   | "history-match"
@@ -20,7 +21,7 @@ export type InputDecisionSource =
 export type InputDecisionContext = {
   text: string;
   agentAvailable: boolean;
-  manualOverride?: TerminalInputTarget | null;
+  routingMode?: TerminalInputMode;
   rawTerminal?: boolean;
   captureReliable?: boolean;
   matchedHistory?: boolean;
@@ -36,13 +37,41 @@ export type InputDecision = {
   classifierReason?: TerminalInputDecision["reason"];
 };
 
+export type InputModeIndicator = "inactive" | "automatic" | "fixed";
+
+export function getInputModeIndicator(
+  routingMode: TerminalInputMode,
+  activeTarget: TerminalInputTarget,
+  option: TerminalInputTarget
+): InputModeIndicator {
+  if (routingMode === option && activeTarget === option) return "fixed";
+  if (routingMode === "auto" && activeTarget === option) return "automatic";
+  return "inactive";
+}
+
+export function toggleFixedInputMode(
+  routingMode: TerminalInputMode,
+  target: TerminalInputTarget,
+  targetAvailable = true
+): TerminalInputMode {
+  if (!targetAvailable) return routingMode;
+  return routingMode === target ? "auto" : target;
+}
+
+export function resolvePromptInputTarget(
+  routingMode: TerminalInputMode,
+  agentAvailable: boolean
+): TerminalInputTarget {
+  return routingMode === "agent" && agentAvailable ? "agent" : "shell";
+}
+
 export function resolveInputTargetForDisplay(
   context: InputDecisionContext,
   previousTarget: TerminalInputTarget
 ): TerminalInputTarget {
   if (
     !context.text.trim() &&
-    !context.manualOverride &&
+    (context.routingMode ?? "auto") === "auto" &&
     context.agentAvailable &&
     context.captureReliable !== false &&
     !context.rawTerminal
@@ -50,13 +79,6 @@ export function resolveInputTargetForDisplay(
     return previousTarget;
   }
   return decideTerminalInput(context).target;
-}
-
-export function shouldResetManualOverride(
-  previousDraft: string,
-  currentDraft: string
-): boolean {
-  return Boolean(previousDraft.trim()) && !currentDraft.trim();
 }
 
 function shellDecision(
@@ -77,18 +99,18 @@ export function decideTerminalInput(context: InputDecisionContext): InputDecisio
     return shellDecision("raw-terminal", 1, false);
   }
 
-  if (context.manualOverride === "shell") {
-    return shellDecision("manual-shell", 1, false);
+  if (context.routingMode === "shell") {
+    return shellDecision("fixed-shell", 1, false);
   }
 
-  if (context.manualOverride === "agent") {
+  if (context.routingMode === "agent") {
     if (!context.agentAvailable) {
       return shellDecision("agent-unavailable", 1, false);
     }
     return {
       target: "agent",
       confidence: 1,
-      decisionSource: "manual-agent",
+      decisionSource: "fixed-agent",
       automatic: false,
     };
   }

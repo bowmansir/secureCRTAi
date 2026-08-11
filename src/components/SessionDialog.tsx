@@ -11,6 +11,7 @@ interface Props {
 }
 
 const NEW_GROUP = "__new__";
+const DEFAULT_SSH_USERNAME = "root";
 
 function keyLabel(path: string): string {
   return path.split(/[\\/]/).pop() || path;
@@ -22,13 +23,15 @@ export default function SessionDialog({ editing, groups, onSave, onClose }: Prop
   const [newGroupMode, setNewGroupMode] = useState(false);
   const [host, setHost] = useState("");
   const [port, setPort] = useState(22);
-  const [username, setUsername] = useState("");
+  const [username, setUsername] = useState(DEFAULT_SSH_USERNAME);
   const [authType, setAuthType] = useState<"password" | "key">("password");
   const [password, setPassword] = useState("");
   const [keyPath, setKeyPath] = useState("");
   const [keyPassphrase, setKeyPassphrase] = useState("");
   const [detectedKeys, setDetectedKeys] = useState<string[]>([]);
   const [error, setError] = useState("");
+  const [testResult, setTestResult] = useState<{ ok: boolean; message: string } | null>(null);
+  const [testing, setTesting] = useState(false);
   const [saving, setSaving] = useState(false);
   const hostRef = useRef<HTMLInputElement>(null);
 
@@ -44,7 +47,7 @@ export default function SessionDialog({ editing, groups, onSave, onClose }: Prop
       setGroup(editing.group);
       setHost(editing.host);
       setPort(editing.port);
-      setUsername(editing.username);
+      setUsername(editing.username.trim() || DEFAULT_SSH_USERNAME);
       setAuthType(editing.authType);
       setKeyPath(editing.keyPath ?? "");
       // 密码不回显，留空表示不修改
@@ -69,34 +72,72 @@ export default function SessionDialog({ editing, groups, onSave, onClose }: Prop
       title: "选择 SSH 私钥文件",
       defaultPath: detectedKeys[0]?.replace(/[\\/][^\\/]+$/, ""),
     });
-    if (picked) setKeyPath(picked as string);
+    if (picked) {
+      setKeyPath(picked as string);
+      setTestResult(null);
+    }
   };
 
-  const submit = async () => {
-    if (!host.trim() || !username.trim()) {
-      setError("主机和用户名为必填项（主机栏支持直接粘贴 user@host:port）");
-      return;
+  const buildInput = (): SessionInput | null => {
+    const normalizedHost = host.trim();
+    const normalizedUsername = username.trim() || DEFAULT_SSH_USERNAME;
+    if (!normalizedHost) {
+      setError("主机为必填项（主机栏支持直接粘贴 user@host:port）");
+      return null;
     }
     if (authType === "key" && !keyPath.trim()) {
       setError("请选择私钥文件");
-      return;
+      return null;
     }
-    setSaving(true);
+
+    if (username !== normalizedUsername) setUsername(normalizedUsername);
+    return {
+      id: editing?.id,
+      name: name.trim() || `${normalizedUsername}@${normalizedHost}`,
+      group: group.trim(),
+      host: normalizedHost,
+      port,
+      username: normalizedUsername,
+      authType,
+      // 编辑时留空 = 不修改原密码
+      password: password === "" && editing ? undefined : password,
+      keyPath: authType === "key" ? keyPath.trim() || undefined : undefined,
+      keyPassphrase:
+        authType === "key"
+          ? keyPassphrase === "" && editing
+            ? undefined
+            : keyPassphrase
+          : undefined,
+    };
+  };
+
+  const testConnection = async () => {
+    if (testing || saving) return;
     setError("");
+    setTestResult(null);
+    const input = buildInput();
+    if (!input) return;
+
+    setTesting(true);
     try {
-      await onSave({
-        id: editing?.id,
-        name: name.trim() || `${username}@${host}`,
-        group: group.trim(),
-        host: host.trim(),
-        port,
-        username: username.trim(),
-        authType,
-        // 编辑时留空 = 不修改原密码
-        password: password === "" && editing ? undefined : password,
-        keyPath: keyPath.trim() || undefined,
-        keyPassphrase: keyPassphrase === "" && editing ? undefined : keyPassphrase,
-      });
+      const result = await api.sessionTestConnection(input);
+      setTestResult({ ok: true, message: `${result.message} · ${result.latencyMs} ms` });
+    } catch (e) {
+      setTestResult({ ok: false, message: String(e) });
+    } finally {
+      setTesting(false);
+    }
+  };
+
+  const submit = async () => {
+    if (saving || testing) return;
+    setError("");
+    const input = buildInput();
+    if (!input) return;
+
+    setSaving(true);
+    try {
+      await onSave(input);
       onClose();
     } catch (e) {
       setError(String(e));
@@ -106,12 +147,17 @@ export default function SessionDialog({ editing, groups, onSave, onClose }: Prop
   };
 
   return (
-    <div className="modal-mask" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
+    <div
+      className="modal-mask"
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget && !saving && !testing) onClose();
+      }}
+    >
       <div
         className="modal"
         onKeyDown={(e) => {
-          if (e.key === "Enter" && !saving) submit();
-          if (e.key === "Escape") onClose();
+          if (e.key === "Enter" && !(e.target instanceof HTMLButtonElement) && !saving && !testing) submit();
+          if (e.key === "Escape" && !saving && !testing) onClose();
         }}
       >
         <h3>{editing ? "编辑会话" : "新建 SSH 会话"}</h3>
@@ -121,20 +167,43 @@ export default function SessionDialog({ editing, groups, onSave, onClose }: Prop
             ref={hostRef}
             className="input"
             value={host}
-            onChange={(e) => parseHostInput(e.target.value)}
+            onChange={(e) => {
+              parseHostInput(e.target.value);
+              setTestResult(null);
+            }}
             placeholder="root@192.168.1.10:22 一次填好"
           />
           <label>用户名</label>
-          <input className="input" value={username} onChange={(e) => setUsername(e.target.value)} placeholder="root" />
+          <input
+            className="input"
+            value={username}
+            onChange={(e) => {
+              setUsername(e.target.value);
+              setTestResult(null);
+            }}
+            onBlur={() => {
+              if (!username.trim()) setUsername(DEFAULT_SSH_USERNAME);
+            }}
+          />
           <label>端口</label>
           <input
             className="input"
             type="number"
             value={port}
-            onChange={(e) => setPort(Number(e.target.value) || 22)}
+            onChange={(e) => {
+              setPort(Number(e.target.value) || 22);
+              setTestResult(null);
+            }}
           />
           <label>认证方式</label>
-          <select className="input" value={authType} onChange={(e) => setAuthType(e.target.value as "password" | "key")}>
+          <select
+            className="input"
+            value={authType}
+            onChange={(e) => {
+              setAuthType(e.target.value as "password" | "key");
+              setTestResult(null);
+            }}
+          >
             <option value="password">密码</option>
             <option value="key">私钥文件</option>
           </select>
@@ -145,7 +214,10 @@ export default function SessionDialog({ editing, groups, onSave, onClose }: Prop
                 className="input"
                 type="password"
                 value={password}
-                onChange={(e) => setPassword(e.target.value)}
+                onChange={(e) => {
+                  setPassword(e.target.value);
+                  setTestResult(null);
+                }}
                 placeholder={editing ? "留空则保持不变" : ""}
               />
             </>
@@ -158,6 +230,7 @@ export default function SessionDialog({ editing, groups, onSave, onClose }: Prop
                   value={detectedKeys.includes(keyPath) ? keyPath : keyPath ? "__custom__" : ""}
                   onChange={(e) => {
                     if (e.target.value !== "__custom__") setKeyPath(e.target.value);
+                    setTestResult(null);
                   }}
                 >
                   <option value="">选择检测到的密钥...</option>
@@ -181,7 +254,10 @@ export default function SessionDialog({ editing, groups, onSave, onClose }: Prop
                 className="input"
                 type="password"
                 value={keyPassphrase}
-                onChange={(e) => setKeyPassphrase(e.target.value)}
+                onChange={(e) => {
+                  setKeyPassphrase(e.target.value);
+                  setTestResult(null);
+                }}
                 placeholder={editing ? "留空则保持不变" : "无口令可留空"}
               />
             </>
@@ -233,11 +309,20 @@ export default function SessionDialog({ editing, groups, onSave, onClose }: Prop
           )}
         </div>
         {error && <div className="form-error">{error}</div>}
+        {testResult && (
+          <div className={testResult.ok ? "form-success" : "form-error"} role="status">
+            {testResult.ok ? "连接成功：" : "连接失败："}
+            {testResult.message}
+          </div>
+        )}
         <div className="modal-footer">
-          <button className="btn" onClick={onClose}>
+          <button className="btn" onClick={onClose} disabled={saving || testing}>
             取消
           </button>
-          <button className="btn primary" onClick={submit} disabled={saving}>
+          <button className="btn" type="button" onClick={testConnection} disabled={saving || testing}>
+            {testing ? "测试中..." : "测试连接"}
+          </button>
+          <button className="btn primary" onClick={submit} disabled={saving || testing}>
             {saving ? "保存中..." : "保存（Enter）"}
           </button>
         </div>

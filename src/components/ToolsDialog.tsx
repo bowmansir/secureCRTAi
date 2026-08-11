@@ -461,7 +461,7 @@ function KeyPanel({ sessions, activeSessionId }: { sessions: SessionProfile[]; a
   const [deployErr, setDeployErr] = useState("");
   const [deploying, setDeploying] = useState(false);
 
-  const [genName, setGenName] = useState("id_termai");
+  const [genName, setGenName] = useState("id_termexa");
   const [genComment, setGenComment] = useState("");
   const [genErr, setGenErr] = useState("");
   const [genMsg, setGenMsg] = useState("");
@@ -574,13 +574,13 @@ function KeyPanel({ sessions, activeSessionId }: { sessions: SessionProfile[]; a
       <div className="settings-section-title">生成新密钥（ed25519）</div>
       <div className="form-grid">
         <label>文件名</label>
-        <input className="input" value={genName} onChange={(e) => setGenName(e.target.value)} placeholder="id_termai" />
+        <input className="input" value={genName} onChange={(e) => setGenName(e.target.value)} placeholder="id_termexa" />
         <label>备注</label>
         <input
           className="input"
           value={genComment}
           onChange={(e) => setGenComment(e.target.value)}
-          placeholder="可选，如 termai@laptop"
+          placeholder="可选，如 termexa@laptop"
         />
       </div>
       {genErr && <div className="form-error">{genErr}</div>}
