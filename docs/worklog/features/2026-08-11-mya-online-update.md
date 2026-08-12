@@ -32,6 +32,7 @@ successor_task_id: 019fef82-32f5-7a21-8774-19e85291f80e
 | 0.1.3 | 6 | `431330a5271b964805b79519a373276e51b005a88c25b7dd9aa0cc7e57090591` | 5,145,134 | 生产探针 15 秒容错 |
 | 0.1.4 | 7 | `70409dcadf005ed7bf27f70057c7902574a6ebaad209603fce49cb1d3863c75c` | 5,150,392 | 更新弹窗视觉与布局修复 |
 | 0.1.5 | 9 | `d5e15a31f424b4ad6cb22df1a88ad43864c56c741fc4355e5114cbfcc3aefb68` | 5,157,888 | Agent 授权、通道与输入路由修复 |
+| 0.1.6 | 10 | `08c5a47a3cddb2936a60b01afdeefd6936e6b0b98bcd0ac3a5f2f9bb3e600120` | 5,239,653 | 输入分流、SSH 健康、当前主机高亮与单实例修复 |
 
 生产公开接口验证：0.1.4 请求返回 0.1.5，远端签名与本地 `.sig` 完全一致，下载产物
 SHA-256 与发布记录一致；请求当前 0.1.5 返回 HTTP 204。
@@ -47,6 +48,7 @@ SHA-256 与发布记录一致；请求当前 0.1.5 返回 HTTP 204。
 | 0.1.3 | `/opt/wework-update/backups/wework-before-termexa-0.1.3-20260811135218.db` | `b55f43727ec2740fb6b452584982845ad8975e5877ada409c0ed76b6193f0be0` |
 | 0.1.4 | `/opt/wework-update/backups/wework-before-termexa-0.1.4-20260811141021.db` | `af1da4f611c308c59142f605710948f62f1cbed60ee9b01ab074a984b6d2b832` |
 | 0.1.5 | `/opt/wework-update/backups/wework-before-termexa-0.1.5-20260811180515.db` | `e7cf9a07f5dfd230a50ba83c2a701acef407cb8e50a1c08a77455af5e4aa0aa3` |
+| 0.1.6 | `/opt/wework-update/backups/wework-before-termexa-0.1.6-20260812134053.db` | `ebe7e77742d643efe8f877e5acbc2efebcfe5393145d4c2633a046b6726c56c7` |
 
 ## 真实升级与界面验证
 
