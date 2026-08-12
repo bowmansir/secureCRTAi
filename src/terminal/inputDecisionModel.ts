@@ -103,18 +103,6 @@ export function decideTerminalInput(context: InputDecisionContext): InputDecisio
     return shellDecision("fixed-shell", 1, false);
   }
 
-  if (context.routingMode === "agent") {
-    if (!context.agentAvailable) {
-      return shellDecision("agent-unavailable", 1, false);
-    }
-    return {
-      target: "agent",
-      confidence: 1,
-      decisionSource: "fixed-agent",
-      automatic: false,
-    };
-  }
-
   if (!context.agentAvailable) {
     return shellDecision("agent-unavailable");
   }
@@ -131,7 +119,20 @@ export function decideTerminalInput(context: InputDecisionContext): InputDecisio
     return shellDecision("completion");
   }
 
-  const classified = classifyTerminalInput(context.text, "auto", true);
+  const classified = classifyTerminalInput(
+    context.text,
+    context.routingMode ?? "auto",
+    true
+  );
+  if (context.routingMode === "agent" && classified.target === "agent") {
+    return {
+      target: "agent",
+      confidence: 1,
+      decisionSource: "fixed-agent",
+      automatic: false,
+      classifierReason: classified.reason,
+    };
+  }
   return {
     target: classified.target,
     confidence: classified.confidence,

@@ -13,6 +13,7 @@ import type { CommandPaletteItem } from "./components/CommandPalette";
 import { ContextMenuProvider, SEPARATOR, useContextMenu } from "./components/ContextMenu";
 import { DialogProvider, useDialogs } from "./components/Dialogs";
 import DesktopUpdateDialog from "./components/DesktopUpdateDialog";
+import { applyConnectionStatusToHostHealth } from "./hostHealth";
 import { checkDangerous } from "./dangerous";
 import Icon from "./components/Icons";
 import Resizer from "./components/Resizer";
@@ -283,6 +284,10 @@ function AppInner() {
     () => tabs.flatMap((tab) => splitLayouts[tab.tabId]?.panes ?? [tab]),
     [splitLayouts, tabs]
   );
+  const runtimeTabsRef = useRef(runtimeTabs);
+  runtimeTabsRef.current = runtimeTabs;
+  const sessionsRef = useRef(sessions);
+  sessionsRef.current = sessions;
   const activeRuntimeTabId = activeTab ? activePaneByTab[activeTab] ?? activeTab : null;
   const attachRemoteFileContext = useCallback(
     async (input: { sessionId: string; remotePath: string; content: string }) => {
@@ -495,7 +500,7 @@ function AppInner() {
       });
 
       try {
-        const results = await api.healthCheckSessions(targets, 2500);
+        const results = await api.healthCheckSessions(targets, 6000);
         const checkedAt = Date.now();
         setHostHealth((prev) => {
           const next = { ...prev };
@@ -793,7 +798,7 @@ function AppInner() {
     ]);
   };
 
-  const onStatus = useCallback((tabId: string, status: TabInfo["status"]) => {
+  const onStatus = useCallback((tabId: string, status: TabInfo["status"], message?: string) => {
     // termClose 可能在窗格移除后才返回 exit，不能让迟到事件覆盖接管窗格的状态。
     if (retiredPaneIds.current.has(tabId)) return;
     setTabs((prev) =>
@@ -818,6 +823,22 @@ function AppInner() {
       }
       return changed ? next : prev;
     });
+    const runtimeTab = runtimeTabsRef.current.find((tab) => tab.tabId === tabId);
+    if (runtimeTab?.kind === "ssh" && runtimeTab.sessionId) {
+      const session = sessionsRef.current.find((item) => item.id === runtimeTab.sessionId);
+      const connectedSibling = runtimeTabsRef.current.some(
+        (item) =>
+          item.tabId !== tabId &&
+          item.kind === "ssh" &&
+          item.sessionId === runtimeTab.sessionId &&
+          item.status === "connected"
+      );
+      if (session && !(status === "closed" && connectedSibling)) {
+        setHostHealth((current) =>
+          applyConnectionStatusToHostHealth(current, session, status, message)
+        );
+      }
+    }
   }, []);
 
   const onOutput = useCallback((tabId: string, text: string) => {
@@ -1308,6 +1329,7 @@ function AppInner() {
         groups={groups}
         snippets={snippets}
         highlightedSessionId={highlightSessionId}
+        activeSessionId={activeRuntimeTabInfo?.kind === "ssh" ? activeRuntimeTabInfo.sessionId : null}
         connectedSessionIds={connectedSessionIds}
         hostHealth={hostHealth}
         healthChecking={healthChecking}

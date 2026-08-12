@@ -850,7 +850,7 @@ export default function TerminalView({
     function scheduleReconnect() {
       if (disposedRef.current) return;
       if (attemptsRef.current >= MAX_RECONNECT) {
-        onStatus(tab.tabId, "closed");
+        onStatus(tab.tabId, "closed", "SSH 重连失败，已放弃");
         term.write("\r\n\x1b[31m[重连失败，已放弃。关闭本标签后可重新连接]\x1b[0m\r\n");
         return;
       }
@@ -883,7 +883,7 @@ export default function TerminalView({
         registerTermId(tab.tabId, id);
       }).catch((err) => {
         if (!wasConnectedRef.current) {
-          onStatus(tab.tabId, "closed");
+          onStatus(tab.tabId, "closed", String(err));
           term.write(`\r\n\x1b[31m连接失败: ${String(err)}\x1b[0m\r\n`);
         } else {
           scheduleReconnect();

@@ -1,3 +1,7 @@
+[in-progress] 2026-08-12 发布 Termexa 0.1.6 -> features/2026-08-12-termexa-0.1.6-release.md
+[done] 2026-08-12 修复 当前主机高亮与重复托盘图标 -> fixes/2026-08-12-active-session-and-single-instance.md
+[done] 2026-08-12 修复 SSH 健康检查误报在线 -> fixes/2026-08-12-ssh-health-false-online.md
+[done] 2026-08-12 修复 固定 Agent 模式误接管明确 Shell 命令 -> fixes/2026-08-12-fixed-agent-command-routing.md
 [done] 2026-08-11 发布 Termexa 0.1.5 -> features/2026-08-11-termexa-0.1.5-release.md
 [done] 2026-08-11 修复 Agent 执行超时与通道回收竞态 -> fixes/agent-execution-timeout-lifecycle.md
 [done] 2026-08-11 修复 Agent 证书诊断只读误判 -> fixes/agent-readonly-certificate-diagnostics.md

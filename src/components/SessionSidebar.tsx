@@ -48,6 +48,7 @@ interface Props {
   groups: string[];
   snippets: Snippet[];
   highlightedSessionId?: string | null;
+  activeSessionId?: string | null;
   connectedSessionIds?: string[];
   hostHealth: Record<string, HostHealthView>;
   healthChecking: boolean;
@@ -74,6 +75,7 @@ export default function SessionSidebar({
   groups,
   snippets,
   highlightedSessionId,
+  activeSessionId,
   connectedSessionIds,
   hostHealth,
   healthChecking,
@@ -439,9 +441,12 @@ export default function SessionSidebar({
               {!isCollapsed && items.map((s) => (
                 <div
                   key={s.id}
-                  className={`session-item${highlightedSessionId === s.id ? " highlight" : ""}${
+                  className={`session-item${activeSessionId === s.id ? " active" : ""}${
+                    highlightedSessionId === s.id ? " highlight" : ""
+                  }${
                     dragSession?.active && dragSession.sessionId === s.id ? " dragging" : ""
                   }`}
+                  aria-current={activeSessionId === s.id ? "true" : undefined}
                   onPointerDown={(e) => startSessionDrag(e, s, group)}
                   onDoubleClick={() => onConnect(s)}
                   onContextMenu={(e) => {

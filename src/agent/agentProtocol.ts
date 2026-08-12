@@ -172,6 +172,26 @@ function quotePosixShellArgument(value: string): string {
   return `'${value.replace(/'/g, `'\"'\"'`)}'`;
 }
 
+function isWrappedHtopCommand(command: string): boolean {
+  let rest = command.trim();
+  for (let index = 0; index < 3; index += 1) {
+    const timeoutPrefix = rest.match(
+      /^timeout\s+(?:(?:--signal(?:=\S+|\s+\S+)|--kill-after(?:=\S+|\s+\S+)|-[ks]\s+\S+)\s+)*(?:\d+(?:\.\d+)?[smhd]?)\s+/i
+    );
+    if (timeoutPrefix) {
+      rest = rest.slice(timeoutPrefix[0].length);
+      continue;
+    }
+    const sudoPrefix = rest.match(/^sudo\s+(?:-\S+\s+)*/i);
+    if (sudoPrefix) {
+      rest = rest.slice(sudoPrefix[0].length);
+      continue;
+    }
+    break;
+  }
+  return /^htop\b/i.test(rest);
+}
+
 export function prepareAgentCommand(command: string): {
   command: string;
   note?: string;
@@ -184,7 +204,7 @@ export function prepareAgentCommand(command: string): {
       note: "已将 top 调整为单次批处理模式，执行后自动退出。",
     };
   }
-  if (/^htop\b/.test(line)) {
+  if (isWrappedHtopCommand(line)) {
     return {
       command: "top -b -n 1",
       note: "htop 是交互界面，已用 top 单次批处理模式替代。",

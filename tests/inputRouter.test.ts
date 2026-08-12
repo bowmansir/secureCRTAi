@@ -102,8 +102,41 @@ test("unknown and single-token input safely falls back to shell", () => {
 
 test("manual modes and availability override auto detection", () => {
   assert.equal(classifyTerminalInput("分析服务器", "shell", true).target, "shell");
-  assert.equal(classifyTerminalInput("ls -la", "agent", true).target, "agent");
+  assert.equal(classifyTerminalInput("分析服务器", "agent", true).target, "agent");
   assert.equal(classifyTerminalInput("分析服务器", "agent", false).target, "shell");
+});
+
+test("explicit commands stay in shell even when Agent is fixed", () => {
+  const inputs = [
+    "htop",
+    "ls -la",
+    "./deploy.sh",
+    "custom-tool status",
+    "FOO=bar node app.js",
+    "check --version",
+    "do-release-upgrade",
+    "where.exe nginx",
+    "timeout 5s htop",
+  ];
+
+  for (const input of inputs) {
+    assert.equal(classifyTerminalInput(input, "agent", true).target, "shell", input);
+  }
+});
+
+test("natural requests that mention commands still go to Agent", () => {
+  const inputs = [
+    "检查 nginx 为什么失败",
+    "请运行 htop 并分析结果",
+    "check why nginx failed",
+    "how can I run do-release-upgrade safely",
+    "please explain ls -la output",
+  ];
+
+  for (const input of inputs) {
+    assert.equal(classifyTerminalInput(input, "auto", true).target, "agent", input);
+    assert.equal(classifyTerminalInput(input, "agent", true).target, "agent", input);
+  }
 });
 
 test("recognizes common Linux and PowerShell prompts with ANSI styling", () => {

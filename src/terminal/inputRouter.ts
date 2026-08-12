@@ -200,9 +200,14 @@ function isNaturalLanguage(input: string): boolean {
 }
 
 function looksLikeShellCommand(input: string): boolean {
-  if (ENGLISH_NATURAL_PREFIX.test(input.trim())) return false;
-  const token = firstExecutableToken(input);
-  return /^[A-Za-z0-9_.+/-]+$/.test(token);
+  const trimmed = input.trim();
+  const token = firstExecutableToken(trimmed);
+  if (!/^[A-Za-z0-9_.+/-]+$/.test(token)) return false;
+  if (!ENGLISH_NATURAL_PREFIX.test(trimmed)) return true;
+
+  const remainder = trimmed.slice(trimmed.indexOf(token) + token.length).trimStart();
+  if (!remainder) return true;
+  return /^(?:-{1,2}[A-Za-z0-9]|\/\?|\/?[A-Za-z]:)/.test(remainder);
 }
 
 export function classifyTerminalInput(
@@ -215,9 +220,9 @@ export function classifyTerminalInput(
 
   const trimmed = input.trim();
   if (!trimmed) return shellDecision("empty");
-  if (mode === "agent") return agentDecision("manual-agent");
   if (isKnownCommand(trimmed)) return shellDecision("known-command");
   if (looksLikeShellCommand(trimmed)) return shellDecision("safe-fallback", 0.6);
+  if (mode === "agent") return agentDecision("manual-agent");
   if (isNaturalLanguage(trimmed)) return agentDecision("natural-language", 0.9);
   if (hasShellSyntax(trimmed)) return shellDecision("shell-syntax");
   if (!/\s/.test(trimmed)) return shellDecision("single-token", 0.9);

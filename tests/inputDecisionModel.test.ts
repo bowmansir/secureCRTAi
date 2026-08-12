@@ -28,7 +28,7 @@ test("raw terminal always keeps input in shell", () => {
 test("fixed routing mode persists as an explicit decision source", () => {
   assert.deepEqual(
     decideTerminalInput({
-      text: "ls -la",
+      text: "分析服务器",
       agentAvailable: true,
       routingMode: "agent",
     }),
@@ -37,6 +37,7 @@ test("fixed routing mode persists as an explicit decision source", () => {
       confidence: 1,
       decisionSource: "fixed-agent",
       automatic: false,
+      classifierReason: "manual-agent",
     }
   );
 
@@ -48,6 +49,20 @@ test("fixed routing mode persists as an explicit decision source", () => {
     }).decisionSource,
     "fixed-shell"
   );
+});
+
+test("fixed Agent does not override explicit shell command semantics", () => {
+  for (const text of ["htop", "ls -la", "check --version", "do-release-upgrade"]) {
+    const decision = decideTerminalInput({
+      text,
+      agentAvailable: true,
+      routingMode: "agent",
+    });
+
+    assert.equal(decision.target, "shell", text);
+    assert.notEqual(decision.decisionSource, "fixed-agent", text);
+    assert.notEqual(decision.classifierReason, "manual-agent", text);
+  }
 });
 
 test("automatic and fixed modes expose distinct visual indicators", () => {

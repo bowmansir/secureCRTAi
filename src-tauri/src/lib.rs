@@ -26,7 +26,6 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent}
 use tauri::{Manager, State};
 use terminal::ssh::SshParams;
 use terminal::{TermEvent, TerminalRegistry};
-use tokio::net::TcpStream;
 use tokio::sync::{oneshot, Semaphore};
 use tokio::time::timeout;
 use uuid::Uuid;
@@ -139,12 +138,14 @@ struct HealthCheckResult {
     message: String,
 }
 
-async fn check_session_tcp_health(
+async fn check_session_ssh_health(
     session_id: String,
     profile: Option<SessionProfile>,
+    params: Option<CmdResult<SshParams>>,
     timeout_ms: u64,
     timeout_duration: Duration,
     limiter: Arc<Semaphore>,
+    hostkeys: Arc<hostkeys::HostKeyStore>,
 ) -> HealthCheckResult {
     let Some(profile) = profile else {
         return HealthCheckResult {
@@ -156,23 +157,58 @@ async fn check_session_tcp_health(
             message: "session not found".to_string(),
         };
     };
+    let params = match params {
+        Some(Ok(params)) => params,
+        Some(Err(message)) => {
+            return HealthCheckResult {
+                session_id: profile.id,
+                host: profile.host,
+                port: profile.port,
+                ok: false,
+                latency_ms: None,
+                message,
+            };
+        }
+        None => {
+            return HealthCheckResult {
+                session_id: profile.id,
+                host: profile.host,
+                port: profile.port,
+                ok: false,
+                latency_ms: None,
+                message: "SSH connection parameters are unavailable".to_string(),
+            };
+        }
+    };
 
     let _permit = limiter.acquire_owned().await.ok();
     let started = Instant::now();
     match timeout(
         timeout_duration,
-        TcpStream::connect((profile.host.as_str(), profile.port)),
+        terminal::ssh::connect_and_auth(hostkeys, &params),
     )
     .await
     {
-        Ok(Ok(_)) => HealthCheckResult {
-            session_id: profile.id,
-            host: profile.host,
-            port: profile.port,
-            ok: true,
-            latency_ms: Some(started.elapsed().as_millis() as u64),
-            message: "reachable".to_string(),
-        },
+        Ok(Ok(handle)) => {
+            let latency_ms = started.elapsed().as_millis() as u64;
+            let _ = timeout(
+                Duration::from_secs(1),
+                handle.disconnect(
+                    russh::Disconnect::ByApplication,
+                    "health check complete",
+                    "",
+                ),
+            )
+            .await;
+            HealthCheckResult {
+                session_id: profile.id,
+                host: profile.host,
+                port: profile.port,
+                ok: true,
+                latency_ms: Some(latency_ms),
+                message: "SSH handshake and authentication succeeded".to_string(),
+            }
+        }
         Ok(Err(err)) => HealthCheckResult {
             session_id: profile.id,
             host: profile.host,
@@ -251,7 +287,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn health_check_marks_local_tcp_server_online() {
+    async fn health_check_rejects_a_non_ssh_tcp_listener() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind local listener");
@@ -260,21 +296,35 @@ mod tests {
             let _ = tokio::time::timeout(Duration::from_secs(2), listener.accept()).await;
         });
 
-        let result = check_session_tcp_health(
+        let profile = test_profile("online", "127.0.0.1", port);
+        let params = SshParams {
+            host: profile.host.clone(),
+            port: profile.port,
+            username: profile.username.clone(),
+            password: Some("invalid".to_string()),
+            key_path: None,
+            key_passphrase: None,
+        };
+        let result = check_session_ssh_health(
             "online".to_string(),
-            Some(test_profile("online", "127.0.0.1", port)),
+            Some(profile),
+            Some(Ok(params)),
             1000,
             Duration::from_millis(1000),
             Arc::new(Semaphore::new(1)),
+            Arc::new(hostkeys::HostKeyStore::default()),
         )
         .await;
 
-        assert!(result.ok, "expected reachable result, got {result:?}");
+        assert!(
+            !result.ok,
+            "a TCP listener is not sufficient SSH health evidence: {result:?}"
+        );
         assert_eq!(result.session_id, "online");
         assert_eq!(result.host, "127.0.0.1");
         assert_eq!(result.port, port);
-        assert!(result.latency_ms.is_some());
-        assert_eq!(result.message, "reachable");
+        assert_eq!(result.latency_ms, None);
+        assert!(!result.message.is_empty());
         accept_task.await.expect("accept task");
     }
 
@@ -286,12 +336,23 @@ mod tests {
         let port = listener.local_addr().expect("listener address").port();
         drop(listener);
 
-        let result = check_session_tcp_health(
+        let profile = test_profile("offline", "127.0.0.1", port);
+        let params = SshParams {
+            host: profile.host.clone(),
+            port: profile.port,
+            username: profile.username.clone(),
+            password: Some("invalid".to_string()),
+            key_path: None,
+            key_passphrase: None,
+        };
+        let result = check_session_ssh_health(
             "offline".to_string(),
-            Some(test_profile("offline", "127.0.0.1", port)),
+            Some(profile),
+            Some(Ok(params)),
             1000,
             Duration::from_millis(1000),
             Arc::new(Semaphore::new(1)),
+            Arc::new(hostkeys::HostKeyStore::default()),
         )
         .await;
 
@@ -305,12 +366,14 @@ mod tests {
 
     #[tokio::test]
     async fn health_check_reports_missing_session() {
-        let result = check_session_tcp_health(
+        let result = check_session_ssh_health(
             "missing".to_string(),
+            None,
             None,
             1000,
             Duration::from_millis(1000),
             Arc::new(Semaphore::new(1)),
+            Arc::new(hostkeys::HostKeyStore::default()),
         )
         .await;
 
@@ -1063,13 +1126,19 @@ async fn health_check_sessions(
 
     for session_id in targets {
         let profile = by_id.get(&session_id).cloned();
+        let params = profile
+            .as_ref()
+            .map(|_| ssh_params_from_profile(&state, &session_id));
         let limiter = limiter.clone();
-        tasks.push(tokio::spawn(check_session_tcp_health(
+        let hostkeys = state.hostkeys.clone();
+        tasks.push(tokio::spawn(check_session_ssh_health(
             session_id,
             profile,
+            params,
             timeout_ms,
             timeout_duration,
             limiter,
+            hostkeys,
         )));
     }
 
@@ -1442,7 +1511,12 @@ fn setup_system_tray(app: &mut tauri::App) -> tauri::Result<()> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let store = Store::load().expect("初始化配置存储失败");
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    #[cfg(desktop)]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        show_main_window(app);
+    }));
+    builder
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())

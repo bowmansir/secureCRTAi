@@ -162,3 +162,16 @@ test("persistent diagnostics become five-second Agent samples", () => {
     "timeout 5s pm2 logs 0 || [ $? -eq 124 ]"
   );
 });
+
+test("htop actions always become a compatible non-interactive snapshot", () => {
+  for (const command of [
+    "htop",
+    "sudo htop",
+    "timeout 5s htop -b -n 1",
+    "timeout 5s htop -C -d 10 -n 1",
+  ]) {
+    const prepared = prepareAgentCommand(command);
+    assert.equal(prepared.command, "top -b -n 1", command);
+    assert.match(prepared.note ?? "", /htop/);
+  }
+});
